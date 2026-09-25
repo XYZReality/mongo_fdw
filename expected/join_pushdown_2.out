@@ -936,13 +936,19 @@ SELECT d.c1, d.c2, e.c1, e.c2, d.c6, d.c8
 EXPLAIN (COSTS OFF)
 SELECT d.c1, d.c2, d.c5, e.c1, e.c2
   FROM f_test_tbl1 d LEFT JOIN f_test_tbl2 e ON (e.c1 = d.c8 AND (d.c5 = '02-22-1981' OR d.c5 = '12-17-1980')) ORDER BY 1, 3;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
  Sort
    Sort Key: d.c1, d.c5
-   ->  Foreign Scan
-         Foreign Namespace: (mongo_fdw_regress.test_tbl1 d) LEFT JOIN (mongo_fdw_regress.test_tbl2 e)
-(4 rows)
+   ->  Hash Left Join
+         Hash Cond: (d.c8 = e.c1)
+         Join Filter: ((d.c5 = '02-22-1981'::date) OR (d.c5 = '12-17-1980'::date))
+         ->  Foreign Scan on f_test_tbl1 d
+               Foreign Namespace: mongo_fdw_regress.test_tbl1
+         ->  Hash
+               ->  Foreign Scan on f_test_tbl2 e
+                     Foreign Namespace: mongo_fdw_regress.test_tbl2
+(10 rows)
 
 SELECT d.c1, d.c2, d.c5, e.c1, e.c2
   FROM f_test_tbl1 d LEFT JOIN f_test_tbl2 e ON (e.c1 = d.c8 AND (d.c5 = '02-22-1981' OR d.c5 = '12-17-1980')) ORDER BY 1, 3;
@@ -969,13 +975,19 @@ SELECT d.c1, d.c2, d.c5, e.c1, e.c2
 EXPLAIN (COSTS OFF)
 SELECT d.c1, d.c2, d.c5, e.c1, e.c2
   FROM f_test_tbl1 d LEFT JOIN f_test_tbl2 e ON (e.c1 = d.c8) WHERE d.c5 = '02-22-1981' ORDER BY 1;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
+                             QUERY PLAN                             
+--------------------------------------------------------------------
  Sort
    Sort Key: d.c1
-   ->  Foreign Scan
-         Foreign Namespace: (mongo_fdw_regress.test_tbl1 d) LEFT JOIN (mongo_fdw_regress.test_tbl2 e)
-(4 rows)
+   ->  Hash Left Join
+         Hash Cond: (d.c8 = e.c1)
+         ->  Foreign Scan on f_test_tbl1 d
+               Filter: (c5 = '02-22-1981'::date)
+               Foreign Namespace: mongo_fdw_regress.test_tbl1
+         ->  Hash
+               ->  Foreign Scan on f_test_tbl2 e
+                     Foreign Namespace: mongo_fdw_regress.test_tbl2
+(10 rows)
 
 SELECT d.c1, d.c2, d.c5, e.c1, e.c2
   FROM f_test_tbl1 d LEFT JOIN f_test_tbl2 e ON (e.c1 = d.c8) WHERE d.c5 = '02-22-1981' ORDER BY 1;
@@ -1010,8 +1022,9 @@ SELECT d.c1, d.c2, d.c5, e.c1, e.c2
  Sort
    Sort Key: d.c1
    ->  Foreign Scan
+         Filter: ((c3 = c3) AND (c5 = c5))
          Foreign Namespace: (mongo_fdw_regress.test_tbl1 d) INNER JOIN (mongo_fdw_regress.test_tbl1 e)
-(4 rows)
+(5 rows)
 
 SELECT d.c1, d.c2, d.c5, e.c1, e.c2
   FROM f_test_tbl1 d NATURAL JOIN f_test_tbl1 e WHERE e.c1 > d.c8 ORDER BY 1;
@@ -1101,13 +1114,19 @@ WITH t (c1_1, c1_3, c2_1) AS (
 EXPLAIN (COSTS OFF)
 SELECT d.c1, d.c2, d.c5, e.c1, e.c2
   FROM f_test_tbl2 e LEFT JOIN f_test_tbl1 d ON (e.c1 = d.c8) WHERE d.c5 = '02-22-1981' OR d.c5 = '12-17-1980' ORDER BY 1;
-                                              QUERY PLAN                                               
--------------------------------------------------------------------------------------------------------
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
  Sort
    Sort Key: d.c1
-   ->  Foreign Scan
-         Foreign Namespace: (mongo_fdw_regress.test_tbl2 e) INNER JOIN (mongo_fdw_regress.test_tbl1 d)
-(4 rows)
+   ->  Hash Join
+         Hash Cond: (e.c1 = d.c8)
+         ->  Foreign Scan on f_test_tbl2 e
+               Foreign Namespace: mongo_fdw_regress.test_tbl2
+         ->  Hash
+               ->  Foreign Scan on f_test_tbl1 d
+                     Filter: ((c5 = '02-22-1981'::date) OR (c5 = '12-17-1980'::date))
+                     Foreign Namespace: mongo_fdw_regress.test_tbl1
+(10 rows)
 
 SELECT d.c1, d.c2, d.c5, e.c1, e.c2
   FROM f_test_tbl2 e LEFT JOIN f_test_tbl1 d ON (e.c1 = d.c8) WHERE d.c5 = '02-22-1981' OR d.c5 = '12-17-1980' ORDER BY 1;

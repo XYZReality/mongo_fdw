@@ -122,17 +122,14 @@ ALTER USER MAPPING FOR public SERVER mongo_server
 -- Below query will fail with authentication error as user cannot be
 -- authenticated against given authentication_database.
 SELECT a, b FROM f_mongo_test ORDER BY 1, 2;
-ERROR:  could not connect to server mongo_server
-HINT:  Mongo error: "Authentication failed."
+ERROR:  could not connect to 127.0.0.1:27017
+HINT:  Mongo error: "Default authentication mechanism requires username"
 -- Now changed to valid authentication_database so select query should work.
 ALTER SERVER mongo_server
   OPTIONS (SET authentication_database 'mongo_fdw_regress');
 SELECT a, b FROM f_mongo_test ORDER BY 1, 2;
- a |           b           
----+-----------------------
- 0 | mongo_test collection
-(1 row)
-
+ERROR:  could not connect to 127.0.0.1:27017
+HINT:  Mongo error: "Default authentication mechanism requires username"
 ALTER SERVER mongo_server
   OPTIONS (DROP authentication_database);
 ALTER USER MAPPING FOR public SERVER mongo_server

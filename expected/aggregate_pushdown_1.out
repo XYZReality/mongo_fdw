@@ -82,8 +82,9 @@ SELECT c8, min(c2) FROM fdw137_t1 WHERE c3 = 'ADMIN' GROUP BY c8 HAVING min(c8) 
    Filter: (min(fdw137_t1.c8) = 20)
    ->  Foreign Scan on public.fdw137_t1
          Output: _id, c1, c2, c3, c4, c5, c6, c7, c8
+         Filter: (fdw137_t1.c3 = 'ADMIN'::bpchar)
          Foreign Namespace: mongo_fdw_regress.test_tbl1
-(7 rows)
+(8 rows)
 
 SELECT c8, min(c2) FROM fdw137_t1 WHERE c3 = 'ADMIN' GROUP BY c8 HAVING min(c8) = 20 ORDER BY c8 ASC NULLS FIRST;
  c8 | min  
@@ -277,16 +278,19 @@ SELECT c2, sum(c1) FROM fdw137_t1 GROUP BY c1, c2 HAVING min(c1) > 500 ORDER BY 
 -- Using expressions in HAVING clause. Pushed down.
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT c3, count(*) FROM fdw137_t1 GROUP BY c3 HAVING abs(max(c8)) = abs(10) ORDER BY 1, 2;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
+                          QUERY PLAN                          
+--------------------------------------------------------------
  Sort
    Output: c3, (count(*))
    Sort Key: fdw137_t1.c3, (count(*))
-   ->  Foreign Scan
-         Output: c3, (count(*))
-         Filter: (abs((max(fdw137_t1.c8))) = 10)
-         Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
-(7 rows)
+   ->  HashAggregate
+         Output: c3, count(*)
+         Group Key: fdw137_t1.c3
+         Filter: (abs(max(fdw137_t1.c8)) = 10)
+         ->  Foreign Scan on public.fdw137_t1
+               Output: _id, c1, c2, c3, c4, c5, c6, c7, c8
+               Foreign Namespace: mongo_fdw_regress.test_tbl1
+(10 rows)
 
 SELECT c3, count(*) FROM fdw137_t1 GROUP BY c3 HAVING abs(max(c8)) = abs(10) ORDER BY 1, 2;
     c3     | count 
@@ -297,20 +301,23 @@ SELECT c3, count(*) FROM fdw137_t1 GROUP BY c3 HAVING abs(max(c8)) = abs(10) ORD
 -- Unshippable HAVING clause will be evaluated locally, and other qual in HAVING clause is pushed down
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT count(*) FROM (SELECT c3, count(c1) FROM fdw137_t1 GROUP BY c3 HAVING (avg(c1) / avg(c1)) * random() <= 1 and min(c1) > 100) x;
-                                                       QUERY PLAN                                                        
--------------------------------------------------------------------------------------------------------------------------
+                                                                     QUERY PLAN                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
    Output: count(*)
-   ->  Foreign Scan
+   ->  HashAggregate
          Output: fdw137_t1.c3, NULL::bigint
-         Filter: (((((avg(fdw137_t1.c1)) / (avg(fdw137_t1.c1))))::double precision * random()) <= '1'::double precision)
-         Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
-(6 rows)
+         Group Key: fdw137_t1.c3
+         Filter: ((min(fdw137_t1.c1) > 100) AND ((((avg(fdw137_t1.c1) / avg(fdw137_t1.c1)))::double precision * random()) <= '1'::double precision))
+         ->  Foreign Scan on public.fdw137_t1
+               Output: fdw137_t1._id, fdw137_t1.c1, fdw137_t1.c2, fdw137_t1.c3, fdw137_t1.c4, fdw137_t1.c5, fdw137_t1.c6, fdw137_t1.c7, fdw137_t1.c8
+               Foreign Namespace: mongo_fdw_regress.test_tbl1
+(9 rows)
 
 SELECT count(*) FROM (SELECT c3, count(c1) FROM fdw137_t1 GROUP BY c3 HAVING (avg(c1) / avg(c1)) * random() <= 1 and min(c1) > 100) x;
  count 
 -------
-     0
+     4
 (1 row)
 
 -- Aggregate over join query

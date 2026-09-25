@@ -175,8 +175,9 @@ SELECT c1, c2, c5 FROM f_test_tbl1 e
 --------------------------------------------------
  Foreign Scan on public.f_test_tbl1 e
    Output: c1, c2, c5
+   Filter: (e.c5 <= '1980-12-17'::date)
    Foreign Namespace: mongo_fdw_regress.test_tbl1
-(3 rows)
+(4 rows)
 
 SELECT c1, c2, c5 FROM f_test_tbl1 e
   WHERE c5 <= '1980-12-17'
@@ -306,11 +307,11 @@ EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT c1, c2, c5 FROM f_test_tbl1 e
   WHERE c5 <= '1980-12-17' AND c2 IN ('EMP1', 'EMP5', 'EMP10') AND c1 = 100
   ORDER BY c1;
-                          QUERY PLAN                          
---------------------------------------------------------------
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
  Foreign Scan on public.f_test_tbl1 e
    Output: c1, c2, c5
-   Filter: ((e.c2)::text = ANY ('{EMP1,EMP5,EMP10}'::text[]))
+   Filter: ((e.c5 <= '1980-12-17'::date) AND ((e.c2)::text = ANY ('{EMP1,EMP5,EMP10}'::text[])))
    Foreign Namespace: mongo_fdw_regress.test_tbl1
 (4 rows)
 
