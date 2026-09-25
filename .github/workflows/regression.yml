@@ -1,0 +1,114 @@
+name: regression
+
+on:
+  push:
+    branches: [xyz]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  installcheck:
+    runs-on: ubuntu-24.04
+    env:
+      PG_MAJOR: "18"
+      MONGO_HOST: "127.0.0.1"
+      MONGO_PORT: "27017"
+      MONGO_USER_NAME: "edb"
+      MONGO_PWD: "edb"
+      MONGOC_INSTALL_DIR: /usr/local
+      JSONC_INSTALL_DIR: /usr/local
+
+    services:
+      mongo:
+        image: mongo:7.0
+        ports: ["27017:27017"]
+        env:
+          MONGO_INITDB_ROOT_USERNAME: edb
+          MONGO_INITDB_ROOT_PASSWORD: edb
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ env.PG_MAJOR }} and build dependencies
+        run: |
+          set -eux
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR} \
+            build-essential cmake git pkg-config libssl-dev libsasl2-dev \
+            libzstd-dev libsnappy-dev python3
+          echo "/usr/lib/postgresql/${PG_MAJOR}/bin" >> "$GITHUB_PATH"
+
+      - name: Install mongosh and database tools
+        run: |
+          set -eux
+          curl -fsSL https://pgp.mongodb.com/server-7.0.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/mongodb.gpg
+          echo "deb [signed-by=/usr/share/keyrings/mongodb.gpg] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse" \
+            | sudo tee /etc/apt/sources.list.d/mongodb.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mongodb-mongosh mongodb-database-tools
+
+      - name: Create the regression MongoDB users
+        run: |
+          set -eux
+          for db in mongo_fdw_regress mongo_fdw_regress1 mongo_fdw_regress2; do
+            mongosh "mongodb://edb:edb@${MONGO_HOST}:${MONGO_PORT}/admin" --quiet --eval "
+              db.getSiblingDB('${db}').createUser({
+                user: 'edb', pwd: 'edb',
+                roles: [{role: 'dbOwner', db: '${db}'}, {role: 'readWrite', db: '${db}'}]
+              });"
+          done
+
+      # MONGOC_INSTALL_DIR and JSONC_INSTALL_DIR must be non-empty: autogen.sh
+      # passes them straight to -DCMAKE_INSTALL_PREFIX, and an empty prefix
+      # installs into / and takes over an hour instead of about three minutes.
+      - name: Build and install the driver dependencies
+        run: |
+          set -eux
+          test -n "${MONGOC_INSTALL_DIR}" && test -n "${JSONC_INSTALL_DIR}"
+          export MAKEFLAGS="-j$(nproc)"
+          ./autogen.sh
+          sudo ldconfig
+
+      - name: Build and install mongo_fdw
+        run: |
+          set -eux
+          make USE_PGXS=1 -j"$(nproc)"
+          sudo make USE_PGXS=1 install
+
+      - name: Start PostgreSQL
+        run: |
+          set -eux
+          sudo pg_ctlcluster "${PG_MAJOR}" main start
+          sudo -u postgres createuser -s "$(whoami)"
+          sudo -u postgres createdb -O "$(whoami)" "$(whoami)"
+
+      - name: Load the MongoDB fixtures
+        run: ./mongodb_init.sh
+
+      - name: make installcheck
+        run: make USE_PGXS=1 installcheck
+
+      - name: Show regression diffs on failure
+        if: failure()
+        run: |
+          for f in regression.diffs results/*.out; do
+            [ -f "$f" ] && { echo "===== $f ====="; cat "$f"; }
+          done || true
+
+      - name: Upload regression output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-output
+          path: |
+            regression.diffs
+            regression.out
+            results/
+          if-no-files-found: ignore
