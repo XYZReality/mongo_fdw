@@ -71,9 +71,11 @@ jobs:
       - name: Build and install the driver dependencies
         run: |
           set -eux
-          test -n "${MONGOC_INSTALL_DIR}" && test -n "${JSONC_INSTALL_DIR}"
+          test -n "${MONGOC_INSTALL_DIR}"
+          test -n "${JSONC_INSTALL_DIR}"
           export MAKEFLAGS="-j$(nproc)"
-          ./autogen.sh
+          sudo -E env "PATH=$PATH" ./autogen.sh
+          sudo chown -R "$(id -u):$(id -g)" .
           sudo ldconfig
 
       - name: Build and install mongo_fdw
