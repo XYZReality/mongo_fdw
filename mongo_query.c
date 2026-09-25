@@ -2031,10 +2031,27 @@ mongo_type_class(Oid typid)
 			return MONGO_TYPE_BOOL;
 		case TEXTOID:
 		case VARCHAROID:
-		case BPCHAROID:
 		case NAMEOID:
 			return MONGO_TYPE_STRING;
-		case DATEOID:
+
+			/*
+			 * bpchar and date are deliberately absent.
+			 *
+			 * PostgreSQL disregards trailing spaces when comparing
+			 * character(n), while MongoDB compares the stored bytes, so a
+			 * field holding "a" matches a character(3) value of 'a' locally
+			 * but not once the comparison is pushed down.
+			 *
+			 * A BSON date is a millisecond instant.  Read into a date column
+			 * PostgreSQL truncates it to a calendar day, so two documents on
+			 * the same day are equal locally but differ remotely, forming
+			 * separate groups and missing equality predicates.  timestamp and
+			 * timestamptz keep the instant and are unaffected.
+			 *
+			 * Leaving both MONGO_TYPE_NONE evaluates conditions, grouping and
+			 * ordering on such columns locally instead of returning different
+			 * rows.
+			 */
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 			return MONGO_TYPE_DATE;
