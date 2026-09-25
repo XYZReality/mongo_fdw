@@ -84,12 +84,20 @@ jobs:
           make USE_PGXS=1 -j"$(nproc)"
           sudo make USE_PGXS=1 install
 
+      # The PGDG package does not create a cluster when one already exists for
+      # another major version, and the runner image ships one. Create it
+      # explicitly and pick up whichever port pg_createcluster chose.
       - name: Start PostgreSQL
         run: |
           set -eux
-          sudo pg_ctlcluster "${PG_MAJOR}" main start
-          sudo -u postgres createuser -s "$(whoami)"
-          sudo -u postgres createdb -O "$(whoami)" "$(whoami)"
+          sudo pg_createcluster "${PG_MAJOR}" main --start -- --auth-local=trust --auth-host=trust
+          pg_lsclusters
+          PORT="$(pg_lsclusters -h | awk -v v="${PG_MAJOR}" '$1 == v && $2 == "main" { print $3 }')"
+          test -n "$PORT"
+          echo "PGPORT=$PORT" >> "$GITHUB_ENV"
+          echo "PGHOST=/var/run/postgresql" >> "$GITHUB_ENV"
+          sudo -u postgres psql -p "$PORT" -c "CREATE ROLE \"$(whoami)\" SUPERUSER LOGIN"
+          sudo -u postgres createdb -p "$PORT" -O "$(whoami)" "$(whoami)"
 
       - name: Load the MongoDB fixtures
         run: ./mongodb_init.sh
