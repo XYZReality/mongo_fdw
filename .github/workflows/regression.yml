@@ -2,7 +2,7 @@ name: regression
 
 on:
   push:
-    branches: [xyz]
+    branches: [xyz, master]
   pull_request:
   workflow_dispatch:
 
