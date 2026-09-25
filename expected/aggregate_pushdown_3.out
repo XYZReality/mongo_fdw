@@ -74,12 +74,16 @@ SELECT c1, sum(c1), count(*) FROM fdw137_t1 GROUP BY c1 HAVING min(c1) > 500 ORD
 
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT c8, min(c2) FROM fdw137_t1 WHERE c3 = 'ADMIN' GROUP BY c8 HAVING min(c8) = 20 ORDER BY c8 ASC NULLS FIRST;
-                                QUERY PLAN                                 
----------------------------------------------------------------------------
- Foreign Scan
-   Output: c8, (min(c2))
-   Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
-(3 rows)
+                       QUERY PLAN                       
+--------------------------------------------------------
+ GroupAggregate
+   Output: c8, min(c2)
+   Group Key: fdw137_t1.c8
+   Filter: (min(fdw137_t1.c8) = 20)
+   ->  Foreign Scan on public.fdw137_t1
+         Output: _id, c1, c2, c3, c4, c5, c6, c7, c8
+         Foreign Namespace: mongo_fdw_regress.test_tbl1
+(7 rows)
 
 SELECT c8, min(c2) FROM fdw137_t1 WHERE c3 = 'ADMIN' GROUP BY c8 HAVING min(c8) = 20 ORDER BY c8 ASC NULLS FIRST;
  c8 | min  
@@ -90,12 +94,15 @@ SELECT c8, min(c2) FROM fdw137_t1 WHERE c3 = 'ADMIN' GROUP BY c8 HAVING min(c8) 
 -- Multi-column GROUP BY clause. Push-down.
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT c2, sum(c1) FROM fdw137_t1 GROUP BY c1, c2 HAVING min(c1) > 500 ORDER BY 1 ASC NULLS FIRST;
-                                QUERY PLAN                                 
----------------------------------------------------------------------------
- Foreign Scan
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Sort
    Output: c2, (sum(c1)), c1
-   Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
-(3 rows)
+   Sort Key: fdw137_t1.c2 NULLS FIRST
+   ->  Foreign Scan
+         Output: c2, (sum(c1)), c1
+         Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
+(6 rows)
 
 SELECT c2, sum(c1) FROM fdw137_t1 GROUP BY c1, c2 HAVING min(c1) > 500 ORDER BY 1 ASC NULLS FIRST;
   c2   | sum  
@@ -362,7 +369,7 @@ SELECT sum(t2.c1), t1.c8, avg(t1.c8) FROM fdw137_t1 t1 LEFT JOIN fdw137_t2 t2 ON
 -----+----+-----
  100 | 20 |  20
  180 | 30 |  30
-   0 | 60 |  60
+     | 60 |  60
 (3 rows)
 
 -- With ORDER BY pushdown disabled.
@@ -384,7 +391,7 @@ SELECT sum(t2.c1), t1.c8, avg(t1.c8) FROM fdw137_t1 t1 LEFT JOIN fdw137_t2 t2 ON
 -----+----+-----
  100 | 20 |  20
  180 | 30 |  30
-   0 | 60 |  60
+     | 60 |  60
 (3 rows)
 
 SET mongo_fdw.enable_order_by_pushdown TO ON;
@@ -1799,12 +1806,15 @@ ALTER FOREIGN TABLE fdw137_t1 OPTIONS (SET enable_aggregate_pushdown 'true');
 ALTER FOREIGN TABLE fdw137_t1 OPTIONS (ADD enable_order_by_pushdown 'true');
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT c2, sum(c1) FROM fdw137_t1 GROUP BY c1, c2 HAVING min(c1) > 500 ORDER BY 1 ASC NULLS FIRST;
-                                QUERY PLAN                                 
----------------------------------------------------------------------------
- Foreign Scan
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Sort
    Output: c2, (sum(c1)), c1
-   Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
-(3 rows)
+   Sort Key: fdw137_t1.c2 NULLS FIRST
+   ->  Foreign Scan
+         Output: c2, (sum(c1)), c1
+         Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
+(6 rows)
 
 SELECT c2, sum(c1) FROM fdw137_t1 GROUP BY c1, c2 HAVING min(c1) > 500 ORDER BY 1 ASC NULLS FIRST;
   c2   | sum  
@@ -1841,7 +1851,7 @@ SELECT sum(t2.c1), t1.c8, avg(t1.c8) FROM fdw137_t1 t1 LEFT JOIN fdw137_t2 t2 ON
 -----+----+-----
  100 | 20 |  20
  180 | 30 |  30
-   0 | 60 |  60
+     | 60 |  60
 (3 rows)
 
 ALTER FOREIGN TABLE fdw137_t1 OPTIONS (SET enable_order_by_pushdown 'false');
@@ -1892,7 +1902,7 @@ SELECT sum(t2.c1), t1.c8, avg(t1.c8) FROM fdw137_t1 t1 LEFT JOIN fdw137_t2 t2 ON
 -----+----+-----
  100 | 20 |  20
  180 | 30 |  30
-   0 | 60 |  60
+     | 60 |  60
 (3 rows)
 
 -- Test that setting option at table level does not affect the setting at
@@ -1901,12 +1911,15 @@ ALTER SERVER mongo_server OPTIONS (SET enable_order_by_pushdown 'false');
 ALTER FOREIGN TABLE fdw137_t1 OPTIONS (SET enable_order_by_pushdown 'true');
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT c2, sum(c1) FROM fdw137_t1 GROUP BY c1, c2 HAVING min(c1) > 500 ORDER BY 1 ASC NULLS FIRST;
-                                QUERY PLAN                                 
----------------------------------------------------------------------------
- Foreign Scan
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Sort
    Output: c2, (sum(c1)), c1
-   Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
-(3 rows)
+   Sort Key: fdw137_t1.c2 NULLS FIRST
+   ->  Foreign Scan
+         Output: c2, (sum(c1)), c1
+         Foreign Namespace: Aggregate on (mongo_fdw_regress.test_tbl1 fdw137_t1)
+(6 rows)
 
 SELECT c2, sum(c1) FROM fdw137_t1 GROUP BY c1, c2 HAVING min(c1) > 500 ORDER BY 1 ASC NULLS FIRST;
   c2   | sum  
@@ -1941,7 +1954,7 @@ SELECT sum(t2.c1), t1.c8, avg(t1.c8) FROM fdw137_t1 t1 LEFT JOIN fdw137_t2 t2 ON
 -----+----+-----
  100 | 20 |  20
  180 | 30 |  30
-   0 | 60 |  60
+     | 60 |  60
 (3 rows)
 
 -- When option enable_aggregate_pushdown is disabled. Shouldn't pushdown

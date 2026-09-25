@@ -127,8 +127,20 @@
 /* Macro for list API backporting. */
 #define mongo_list_concat(l1, l2) list_concat((l1), (l2))
 
-/* Macro for hard-coded aggregation result key */
-#define AGG_RESULT_KEY		 				"v_agg"
+/*
+ * Hard-coded prefixes of the keys that hold aggregation results in the $group
+ * stage: AGG_RESULT_KEY<n> for aggregates in the target list and
+ * HAVING_RESULT_KEY<n> for aggregates in the HAVING clause.
+ */
+#define AGG_RESULT_KEY		 				"AGG_RESULT_KEY"
+#define HAVING_RESULT_KEY	 				"v_having"
+
+/*
+ * Suffix of the companion key counting the numeric inputs of a SUM()
+ * aggregate, which lets SUM() over no non-null input return NULL like
+ * PostgreSQL rather than MongoDB's 0.
+ */
+#define AGG_COUNT_SUFFIX	 				"_n"
 
 /*
  * We build a hash table that stores the column details.  However, a table can
@@ -239,6 +251,18 @@ typedef struct MongoFdwModifyState
 	uint32		relType;		/* relation type.  Base, Join, Upper, or Upper
 								 * on join */
 	char	   *outerRelName;	/* Outer relation name */
+
+	/*
+	 * An aggregation without GROUP BY returns one row even if there is no
+	 * input, but MongoDB's $group stage returns no document at all then.
+	 * isUngroupedAgg tells to make up that row if the scan returned nothing
+	 * (rowReturned).
+	 */
+	bool		isUngroupedAgg;
+	bool		rowReturned;
+
+	/* The cursor is exhausted; the driver errors on advancing it further */
+	bool		cursorDone;
 } MongoFdwModifyState;
 
 /*
@@ -278,6 +302,12 @@ typedef struct MongoFdwRelationInfo
 
 	/* Name of the base rel (not set for join rels!) */
 	char	   *base_relname;
+
+	/*
+	 * Remote document count fetched for use_remote_estimate, so that it is
+	 * fetched only once per planning.  Negative if not fetched.
+	 */
+	double		remote_doc_count;
 
 	/*
 	 * Name of the relation while EXPLAINing ForeignScan.  It is used for join
@@ -415,7 +445,7 @@ typedef enum MongoFdwRelType
 } MongoFdwRelType;
 
 /* options.c */
-extern MongoFdwOptions *mongo_get_options(Oid foreignTableId);
+extern MongoFdwOptions *mongo_get_options(Oid foreignTableId, Oid userid);
 extern void mongo_free_options(MongoFdwOptions *options);
 extern StringInfo mongo_option_names_string(Oid currentContextId);
 
@@ -448,7 +478,8 @@ extern EquivalenceMember *mongo_find_em_for_rel(PlannerInfo *root,
 												EquivalenceClass *ec,
 												RelOptInfo *rel);
 extern bool mongo_is_builtin(Oid oid);
-extern bool mongo_is_default_sort_operator(EquivalenceMember *em,
+extern bool mongo_is_default_sort_operator(PlannerInfo *root,
+										   EquivalenceMember *em,
 										   PathKey *pathkey);
 extern bool mongo_is_foreign_pathkey(PlannerInfo *root, RelOptInfo *baserel,
 									 PathKey *pathkey);

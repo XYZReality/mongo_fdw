@@ -26,8 +26,10 @@
 #include "common/hashfn.h"
 #include "mongoc.h"
 #include "mongo_query.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
+#include "utils/pg_locale.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -72,6 +74,8 @@ static void mongo_prepare_pipeline(List *clause, BSON *inner_pipeline,
 								   pipeline_cxt *context);
 static void mongo_append_clauses_to_pipeline(List *clause, BSON *child_doc,
 											 pipeline_cxt *context);
+static bool mongo_is_shippable_opexpr(OpExpr *oe, const char *oname);
+static bool mongo_is_shippable_aggref(Aggref *agg, const char *func_name);
 
 #if PG_VERSION_NUM >= 160000
 static List *mongo_append_unique_var(List *varlist, Var *var);
@@ -169,12 +173,12 @@ static List *mongo_append_unique_var(List *varlist, Var *var);
  *         "$group":
  *         {
  *           "_id": {"name": "$name"},
- *           "v_agg0": {"$sum": "$age"},
- *           "v_having": {"$min": "$name"}
+ *           "AGG_RESULT_KEY0": {"$sum": "$age"},
+ *           "v_having0": {"$min": "$name"}
  *         }
  *       },
  *       {
- *         "$match": {"v_having": "xyz"}
+ *         "$match": {"v_having0": "xyz"}
  *       }
  *		 { "$sort": { "name" : -1 } }
  *     ])
@@ -260,7 +264,6 @@ mongo_query_document(ForeignScanState *scanStateNode)
 		BSON		let_exprs;
 		BSON		unwind_stage;
 		BSON		unwind;
-		BSON	   *inner_pipeline_doc = bsonCreate();
 		ListCell   *cell1;
 		ListCell   *cell2;
 
@@ -298,25 +301,23 @@ mongo_query_document(ForeignScanState *scanStateNode)
 		}
 		bsonAppendFinishObject(&lookup, &let_exprs);	/* End "let" */
 
-		/* Form inner pipeline required in $lookup stage to execute $match */
-		bsonAppendStartArray(inner_pipeline_doc, "pipeline", &inner_pipeline);
+		/*
+		 * Form inner pipeline required in $lookup stage to execute $match.
+		 * It stays empty (i.e. a cross join) if there are no join clauses.
+		 */
+		bsonAppendStartArray(&lookup, "pipeline", &inner_pipeline);
 		if (joinclauses)
 		{
-			pipeline_cxt context;
+			pipeline_cxt context = {0};
 
 			context.colInfoHash = columnInfoHash;
-			context.isBoolExpr = false;
 			context.isJoinClause = true;
 			context.scanStateNode = scanStateNode;
 
 			/* Form equivalent join qual clauses in MongoDB */
 			mongo_prepare_pipeline(joinclauses, &inner_pipeline, &context);
-			bsonAppendFinishArray(inner_pipeline_doc, &inner_pipeline);
 		}
-
-		/* Append inner pipeline to $lookup stage */
-		bson_append_array(&lookup, "pipeline", (int) strlen("pipeline"),
-						  &inner_pipeline);
+		bsonAppendFinishArray(&lookup, &inner_pipeline);
 
 		bsonAppendUTF8(&lookup, "as", "Join_Result");
 		bsonAppendFinishObject(&lookup_object, &lookup);
@@ -347,11 +348,9 @@ mongo_query_document(ForeignScanState *scanStateNode)
 	 */
 	if (opExpressionList)
 	{
-		pipeline_cxt context;
+		pipeline_cxt context = {0};
 
 		context.colInfoHash = columnInfoHash;
-		context.isBoolExpr = false;
-		context.isJoinClause = false;
 		context.scanStateNode = scanStateNode;
 
 		bsonAppendStartObject(&root_pipeline, psprintf("%d", root_index++),
@@ -378,7 +377,9 @@ mongo_query_document(ForeignScanState *scanStateNode)
 		ListCell   *cell2;
 		ListCell   *cell3;
 		List	   *is_having_list;
+		List	   *sum_keys = NIL;
 		Index		aggIndex = 0;
+		Index		havingIndex = 0;
 
 		func_list = list_nth(PrivateList, mongoFdwPrivateAggType);
 		agg_col_list = list_nth(PrivateList, mongoFdwPrivateAggColList);
@@ -396,6 +397,11 @@ mongo_query_document(ForeignScanState *scanStateNode)
 		 * stage.  In case of aggregation on join result, a column of the
 		 * inner table needs to be accessed by prefixing it using
 		 * "Join_Result", which is been hardcoded.
+		 *
+		 * Group on the value as PostgreSQL would see it: missing fields and
+		 * values that can't be converted to the column type both become NULL
+		 * (and so form a single group), and ObjectIds of a string column are
+		 * compared as their hex strings.
 		 */
 		if (groupby_col_list)
 		{
@@ -418,13 +424,17 @@ mongo_query_document(ForeignScanState *scanStateNode)
 															  &found);
 				if (found)
 				{
+					char	   *field;
+
 					if (columnInfo->isOuter)
-						bsonAppendUTF8(&groupby_expr, columnInfo->colName,
-									   psprintf("$%s", columnInfo->colName));
+						field = psprintf("$%s", columnInfo->colName);
 					else
-						bsonAppendUTF8(&groupby_expr, columnInfo->colName,
-									   psprintf("$Join_Result.%s",
-												columnInfo->colName));
+						field = psprintf("$Join_Result.%s",
+										 columnInfo->colName);
+
+					mongo_append_typed_value(&groupby_expr,
+											 columnInfo->colName, field,
+											 column->vartype);
 				}
 			}
 			bsonAppendFinishObject(&group, &groupby_expr);	/* End "_id" */
@@ -444,14 +454,19 @@ mongo_query_document(ForeignScanState *scanStateNode)
 			char	   *func_name = strVal(lfirst(cell1));
 			Var		   *column = (Var *) lfirst(cell2);
 			bool		is_having_agg = lfirst_int(cell3);
+			char	   *result_key;
 
+			/*
+			 * Each aggregate gets a key of its own, numbered in the order in
+			 * which the deparser visits them (see mongo_append_expr()).
+			 */
 			if (is_having_agg)
-				bsonAppendStartObject(&group, "v_having", &group_expr);
+				result_key = psprintf("%s%d", HAVING_RESULT_KEY,
+									  havingIndex++);
 			else
-				bsonAppendStartObject(&group,
-									  psprintf("AGG_RESULT_KEY%d",
-											   aggIndex++),
-									  &group_expr);
+				result_key = psprintf("%s%d", AGG_RESULT_KEY, aggIndex++);
+
+			bsonAppendStartObject(&group, result_key, &group_expr);
 
 			key.varNo = column->varno;
 			key.varAttno = column->varattno;
@@ -473,16 +488,51 @@ mongo_query_document(ForeignScanState *scanStateNode)
 			 * In case of aggregation over the join, the resulted columns of
 			 * inner relation need to be accessed by prefixing it with
 			 * "Join_Result".
+			 *
+			 * The aggregated values are filtered by type the same way as the
+			 * GROUP BY columns, so that values that PostgreSQL would read as
+			 * NULL are ignored by the aggregate.
 			 */
 			if (found && strcmp(func_name, "count") != 0)
 			{
+				char	   *field;
+
 				if (columnInfo->isOuter)
-					bsonAppendUTF8(&group_expr, psprintf("$%s", func_name),
-								   psprintf("$%s", columnInfo->colName));
+					field = psprintf("$%s", columnInfo->colName);
 				else
-					bsonAppendUTF8(&group_expr, psprintf("$%s", func_name),
-								   psprintf("$Join_Result.%s",
-											columnInfo->colName));
+					field = psprintf("$Join_Result.%s", columnInfo->colName);
+
+				mongo_append_typed_value(&group_expr,
+										 psprintf("$%s", func_name), field,
+										 column->vartype);
+				bsonAppendFinishObject(&group, &group_expr);
+
+				/*
+				 * MongoDB's $sum returns 0 rather than NULL when there is no
+				 * input, so also count the inputs to fix that up later.
+				 */
+				if (strcmp(func_name, "sum") == 0)
+				{
+					BSON		count_expr;
+					BSON		count_sum;
+					BSON		count_cond;
+
+					bsonAppendStartObject(&group,
+										  psprintf("%s%s", result_key,
+												   AGG_COUNT_SUFFIX),
+										  &count_expr);
+					bsonAppendStartObject(&count_expr, "$sum", &count_sum);
+					bsonAppendStartArray(&count_sum, "$cond", &count_cond);
+					mongo_append_type_check(&count_cond, "0", field,
+											column->vartype);
+					bsonAppendInt32(&count_cond, "1", 1);
+					bsonAppendInt32(&count_cond, "2", 0);
+					bsonAppendFinishArray(&count_sum, &count_cond);
+					bsonAppendFinishObject(&count_expr, &count_sum);
+					bsonAppendFinishObject(&group, &count_expr);
+
+					sum_keys = lappend(sum_keys, result_key);
+				}
 			}
 			else
 			{
@@ -491,22 +541,58 @@ mongo_query_document(ForeignScanState *scanStateNode)
 				 * the MongoDB.
 				 */
 				bsonAppendInt32(&group_expr, psprintf("$%s", "sum"), 1);
+				bsonAppendFinishObject(&group, &group_expr);
 			}
-
-			bsonAppendFinishObject(&group, &group_expr);
 		}
 
 		bsonAppendFinishObject(&group_stage, &group);
 		bsonAppendFinishObject(&root_pipeline, &group_stage);
 
+		/*
+		 * Replace SUM() results with NULL where there was no input to sum,
+		 * before HAVING can see them.
+		 */
+		if (sum_keys)
+		{
+			BSON		fields_stage;
+			BSON		fields;
+
+			bsonAppendStartObject(&root_pipeline, psprintf("%d", root_index++),
+								  &fields_stage);
+			bsonAppendStartObject(&fields_stage, "$addFields", &fields);
+			foreach(cell1, sum_keys)
+			{
+				char	   *result_key = (char *) lfirst(cell1);
+				BSON		field_expr;
+				BSON		cond;
+				BSON		cond_if;
+				BSON		gt;
+
+				bsonAppendStartObject(&fields, result_key, &field_expr);
+				bsonAppendStartArray(&field_expr, "$cond", &cond);
+				bsonAppendStartObject(&cond, "0", &cond_if);
+				bsonAppendStartArray(&cond_if, "$gt", &gt);
+				bsonAppendUTF8(&gt, "0", psprintf("$%s%s", result_key,
+												  AGG_COUNT_SUFFIX));
+				bsonAppendInt32(&gt, "1", 0);
+				bsonAppendFinishArray(&cond_if, &gt);
+				bsonAppendFinishObject(&cond, &cond_if);
+				bsonAppendUTF8(&cond, "1", psprintf("$%s", result_key));
+				bsonAppendNull(&cond, "2");
+				bsonAppendFinishArray(&field_expr, &cond);
+				bsonAppendFinishObject(&fields, &field_expr);
+			}
+			bsonAppendFinishObject(&fields_stage, &fields);
+			bsonAppendFinishObject(&root_pipeline, &fields_stage);
+		}
+
 		/* Add HAVING operation */
 		if (having_expr)
 		{
-			pipeline_cxt context;
+			pipeline_cxt context = {0};
 
 			context.colInfoHash = columnInfoHash;
-			context.isBoolExpr = false;
-			context.isJoinClause = false;
+			context.isHaving = true;
 			context.scanStateNode = scanStateNode;
 
 			/* $match stage.  Add a filter for the HAVING clause */
@@ -585,8 +671,9 @@ mongo_query_document(ForeignScanState *scanStateNode)
 		 * Add skip stage for OFFSET clause.  However, don't add the same if
 		 * either offset is not provided or the offset value is zero.
 		 */
-		offset_value = (int64) intVal(list_nth(PrivateList,
-											   mongoFdwPrivateLimitOffsetList));
+		offset_value = (int64) strtoll(strVal(list_nth(PrivateList,
+												mongoFdwPrivateLimitOffsetList)),
+								NULL, 10);
 		if (offset_value != -1 && offset_value != 0)
 		{
 			BSON		skip_stage;
@@ -601,10 +688,24 @@ mongo_query_document(ForeignScanState *scanStateNode)
 		 * Add limit stage for LIMIT clause.  However, don't add the same if
 		 * the limit is not provided.
 		 */
-		limit_value = (int64) intVal(list_nth(PrivateList,
-											  mongoFdwPrivateLimitCountList));
+		limit_value = (int64) strtoll(strVal(list_nth(PrivateList,
+											   mongoFdwPrivateLimitCountList)),
+							   NULL, 10);
 
-		if (limit_value != -1)
+		if (limit_value == 0)
+		{
+			BSON		match_none;
+			BSON		expr;
+
+			/* $limit must be positive, so use {$match: {$expr: false}} */
+			bsonAppendStartObject(&root_pipeline, psprintf("%d", root_index++),
+								  &match_none);
+			bsonAppendStartObject(&match_none, "$match", &expr);
+			bsonAppendBool(&expr, "$expr", false);
+			bsonAppendFinishObject(&match_none, &expr);
+			bsonAppendFinishObject(&root_pipeline, &match_none);
+		}
+		else if (limit_value != -1)
 		{
 			BSON		limit_stage;
 
@@ -801,7 +902,7 @@ append_mongo_value(BSON *queryDocument, const char *keyName, Datum value,
 					len = VARSIZE_4B(result) - VARHDRSZ;
 					data = VARDATA_4B(result);
 				}
-				if (strcmp(keyName, "_id") == 0)
+				if (strcmp(keyName, "_id") == 0 && len == 12)
 				{
 					bson_oid_t	oid;
 
@@ -815,16 +916,23 @@ append_mongo_value(BSON *queryDocument, const char *keyName, Datum value,
 			break;
 		case NAMEOID:
 			{
-				char	   *outputString;
-				Oid			outputFunctionId;
-				bool		typeVarLength;
+				char	   *outputString = NameStr(*DatumGetName(value));
 				bson_oid_t	bsonObjectId;
 
-				memset(bsonObjectId.bytes, 0, sizeof(bsonObjectId.bytes));
-				getTypeOutputInfo(id, &outputFunctionId, &typeVarLength);
-				outputString = OidOutputFunctionCall(outputFunctionId, value);
-				bsonOidFromString(&bsonObjectId, outputString);
-				status = bsonAppendOid(queryDocument, keyName, &bsonObjectId);
+				/*
+				 * The NAME type represents a BSON ObjectId, so store valid
+				 * ObjectId strings as such.  Anything else can't be an
+				 * ObjectId and is stored as a string.
+				 */
+				if (bson_oid_is_valid(outputString, strlen(outputString)))
+				{
+					bsonOidFromString(&bsonObjectId, outputString);
+					status = bsonAppendOid(queryDocument, keyName,
+										   &bsonObjectId);
+				}
+				else
+					status = bsonAppendUTF8(queryDocument, keyName,
+											outputString);
 			}
 			break;
 		case DATEOID:
@@ -875,14 +983,21 @@ append_mongo_value(BSON *queryDocument, const char *keyName, Datum value,
 				{
 					Datum		valueDatum;
 					float8		valueFloat;
+					char		elemKey[12];
+
+					/* BSON array elements are keyed by their index */
+					snprintf(elemKey, sizeof(elemKey), "%d", i);
 
 					if (elem_nulls[i])
+					{
+						status = bsonAppendNull(&childDocument, elemKey);
 						continue;
+					}
 
 					valueDatum = DirectFunctionCall1(numeric_float8,
 													 elem_values[i]);
 					valueFloat = DatumGetFloat8(valueDatum);
-					status = bsonAppendDouble(&childDocument, keyName,
+					status = bsonAppendDouble(&childDocument, elemKey,
 											  valueFloat);
 				}
 				bsonAppendFinishArray(queryDocument, &childDocument);
@@ -916,15 +1031,22 @@ append_mongo_value(BSON *queryDocument, const char *keyName, Datum value,
 					char	   *valueString;
 					Oid			outputFunctionId;
 					bool		typeVarLength;
+					char		elemKey[12];
+
+					/* BSON array elements are keyed by their index */
+					snprintf(elemKey, sizeof(elemKey), "%d", i);
 
 					if (elem_nulls[i])
+					{
+						status = bsonAppendNull(&childDocument, elemKey);
 						continue;
+					}
 
 					getTypeOutputInfo(TEXTOID, &outputFunctionId,
 									  &typeVarLength);
 					valueString = OidOutputFunctionCall(outputFunctionId,
 														elem_values[i]);
-					status = bsonAppendUTF8(&childDocument, keyName,
+					status = bsonAppendUTF8(&childDocument, elemKey,
 											valueString);
 				}
 				bsonAppendFinishArray(queryDocument, &childDocument);
@@ -1133,6 +1255,26 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 				if (bms_is_member(var->varno, glob_cxt->relids) &&
 					var->varlevelsup == 0)
 				{
+					RangeTblEntry *rte;
+					char	   *colname;
+
+					/*
+					 * Whole-row references and system columns don't
+					 * correspond to any document field.
+					 */
+					if (var->varattno <= 0)
+						return false;
+
+					/*
+					 * Neither do the whole document (__doc) nor field names
+					 * that MongoDB can't reference in expressions.
+					 */
+					rte = planner_rt_fetch(var->varno, glob_cxt->root);
+					colname = get_attname(rte->relid, var->varattno, false);
+					if (strcmp(colname, "__doc") == 0 ||
+						mongo_is_unsafe_column_name(colname))
+						return false;
+
 					/* Var belongs to foreign table */
 					collation = var->varcollid;
 					state = OidIsValid(collation) ? FDW_COLLATE_SAFE : FDW_COLLATE_NONE;
@@ -1171,6 +1313,14 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 				if (collation == InvalidOid ||
 					collation == DEFAULT_COLLATION_OID)
 					state = FDW_COLLATE_NONE;
+				else if (mongo_collation_is_c(collation))
+				{
+					/*
+					 * MongoDB compares strings bytewise anyway.  In
+					 * particular, constants of type name have this collation.
+					 */
+					state = FDW_COLLATE_NONE;
+				}
 				else
 					state = FDW_COLLATE_UNSAFE;
 			}
@@ -1192,7 +1342,8 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 				 */
 				collation = p->paramcollid;
 				if (collation == InvalidOid ||
-					collation == DEFAULT_COLLATION_OID)
+					collation == DEFAULT_COLLATION_OID ||
+					mongo_collation_is_c(collation))
 					state = FDW_COLLATE_NONE;
 				else
 					state = FDW_COLLATE_UNSAFE;
@@ -1210,10 +1361,13 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 
 				/*
 				 * We support =, <, >, <=, >=, <>, +, -, *, /, %, ^, |/, and @
-				 * operators for joinclause of join relation.
+				 * operators, but only the built-in ones, and only for
+				 * argument types for which MongoDB computes the same result
+				 * as PostgreSQL.
 				 */
-				if (!(strncmp(oname, EQUALITY_OPERATOR_NAME, NAMEDATALEN) == 0) &&
-					(mongo_operator_name(oname) == NULL))
+				if (!mongo_is_builtin(oe->opno) ||
+					mongo_operator_name(oname) == NULL ||
+					!mongo_is_shippable_opexpr(oe, oname))
 					return false;
 
 				/*
@@ -1235,6 +1389,22 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 				else if (inner_cxt.state != FDW_COLLATE_SAFE ||
 						 oe->inputcollid != inner_cxt.collation)
 					return false;
+
+				/*
+				 * MongoDB compares strings bytewise.  That matches PostgreSQL
+				 * for equality under any deterministic collation, but for
+				 * ordering only under the "C" collation.
+				 */
+				if (OidIsValid(oe->inputcollid))
+				{
+					if (strcmp(oname, "=") == 0 || strcmp(oname, "<>") == 0)
+					{
+						if (!get_collation_isdeterministic(oe->inputcollid))
+							return false;
+					}
+					else if (!mongo_collation_is_c(oe->inputcollid))
+						return false;
+				}
 
 				/* Result-collation handling */
 				collation = oe->opcollid;
@@ -1272,6 +1442,15 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 					state = FDW_COLLATE_SAFE;
 				else if (collation == DEFAULT_COLLATION_OID)
 					state = FDW_COLLATE_NONE;
+				else if (inner_cxt.state == FDW_COLLATE_SAFE &&
+						 mongo_collation_is_c(collation))
+				{
+					/*
+					 * An explicit COLLATE "C" on a foreign Var is what MongoDB
+					 * does anyway.
+					 */
+					state = FDW_COLLATE_SAFE;
+				}
 				else
 					state = FDW_COLLATE_UNSAFE;
 			}
@@ -1335,19 +1514,8 @@ foreign_expr_walker(Node *node, foreign_glob_cxt *glob_cxt,
 					agg->aggdistinct)
 					return false;
 
-				if (!(strcmp(func_name, "min") == 0 ||
-					  strcmp(func_name, "max") == 0 ||
-					  strcmp(func_name, "sum") == 0 ||
-					  strcmp(func_name, "avg") == 0 ||
-					  strcmp(func_name, "count") == 0))
-					return false;
-
-				/*
-				 * Don't push down when the count is on the column.  This
-				 * restriction is due to the unavailability of syntax in the
-				 * MongoDB to provide a count of the particular column.
-				 */
-				if (!strcmp(func_name, "count") && agg->args)
+				if (!mongo_is_builtin(agg->aggfnoid) ||
+					!mongo_is_shippable_aggref(agg, func_name))
 					return false;
 
 				/*
@@ -1648,7 +1816,6 @@ static void
 mongo_prepare_pipeline(List *clause, BSON *inner_pipeline,
 					   pipeline_cxt *context)
 {
-	BSON	   *and_query_doc = bsonCreate();
 	BSON		match_object;
 	BSON		match_stage;
 	BSON		expr;
@@ -1656,19 +1823,14 @@ mongo_prepare_pipeline(List *clause, BSON *inner_pipeline,
 
 	if (context->isJoinClause)
 	{
-		int			inner_pipeline_index = 0;
-
-		bsonAppendStartObject(inner_pipeline,
-							  psprintf("%d", inner_pipeline_index++),
-							  &match_object);
+		bsonAppendStartObject(inner_pipeline, "0", &match_object);
 		bsonAppendStartObject(&match_object, "$match", &match_stage);
 	}
 	else
 		bsonAppendStartObject(inner_pipeline, "$match", &match_stage);
 
 	bsonAppendStartObject(&match_stage, "$expr", &expr);
-
-	bsonAppendStartArray(and_query_doc, "$and", &and_op);
+	bsonAppendStartArray(&expr, "$and", &and_op);
 
 	context->arrayIndex = 0;
 	context->opExprCount = 0;
@@ -1676,10 +1838,7 @@ mongo_prepare_pipeline(List *clause, BSON *inner_pipeline,
 	/* Append JOIN/WHERE/HAVING clause expression */
 	mongo_append_clauses_to_pipeline(clause, &and_op, context);
 
-	/* Append $and array to $expr */
-	bson_append_array(&expr, "$and", (int) strlen("$and"), &and_op);
-
-	bsonAppendFinishArray(and_query_doc, &and_op);
+	bsonAppendFinishArray(&expr, &and_op);
 	bsonAppendFinishObject(&match_stage, &expr);
 	if (context->isJoinClause)
 	{
@@ -1713,9 +1872,422 @@ mongo_append_clauses_to_pipeline(List *clause, BSON *child_doc,
 			expr = ri->clause;
 		}
 
-		mongo_append_expr(expr, child_doc, context);
+		mongo_append_clause(expr, child_doc, context);
 		context->arrayIndex++;
 	}
+}
+
+/*
+ * mongo_is_shippable_opexpr
+ *		Check whether MongoDB evaluates the given operator the same way as
+ *		PostgreSQL does for its argument types.
+ *
+ * Comparison operators are shippable when both sides belong to the same type
+ * class (see mongo_type_class()).  Arithmetic operators are shippable only on
+ * numbers, and not for division other than floating-point division, since
+ * $divide always returns a double (e.g. 3 / 2 is 1 in PostgreSQL but 1.5 in
+ * MongoDB).  Date/time arithmetic isn't shippable either: MongoDB adds
+ * milliseconds where PostgreSQL adds days.
+ */
+static bool
+mongo_is_shippable_opexpr(OpExpr *oe, const char *oname)
+{
+	Node	   *larg;
+	Node	   *rarg;
+	Oid			ltype;
+	Oid			rtype;
+	MongoTypeClass tclass;
+
+	if (list_length(oe->args) == 1)
+	{
+		/* Prefix operators: only @ (absolute value) and |/ (square root) */
+		if (strcmp(oname, "@") != 0 && strcmp(oname, "|/") != 0)
+			return false;
+
+		return mongo_type_class(exprType(linitial(oe->args))) == MONGO_TYPE_NUMBER &&
+			mongo_type_class(oe->opresulttype) == MONGO_TYPE_NUMBER;
+	}
+
+	if (list_length(oe->args) != 2 ||
+		strcmp(oname, "@") == 0 || strcmp(oname, "|/") == 0)
+		return false;
+
+	larg = linitial(oe->args);
+	rarg = lsecond(oe->args);
+	ltype = exprType(larg);
+	rtype = exprType(rarg);
+	tclass = mongo_type_class(ltype);
+
+	if (tclass == MONGO_TYPE_NONE || tclass != mongo_type_class(rtype))
+		return false;
+
+	if (oe->opresulttype == BOOLOID)
+	{
+		/* Comparison operators */
+
+		/*
+		 * Cross-type date/time comparisons convert using the session time
+		 * zone, which MongoDB knows nothing about.
+		 */
+		if (tclass == MONGO_TYPE_DATE && ltype != rtype)
+			return false;
+
+		/*
+		 * String ordering comparisons are deparsed specially to cope with
+		 * ObjectIds (see mongo_append_string_comparison()), which requires
+		 * a column on one side and a value on the other.
+		 */
+		if (tclass == MONGO_TYPE_STRING &&
+			strcmp(oname, "=") != 0 && strcmp(oname, "<>") != 0)
+		{
+			while (IsA(larg, RelabelType))
+				larg = (Node *) ((RelabelType *) larg)->arg;
+			while (IsA(rarg, RelabelType))
+				rarg = (Node *) ((RelabelType *) rarg)->arg;
+
+			if (!((IsA(larg, Var) && (IsA(rarg, Const) || IsA(rarg, Param))) ||
+				  (IsA(rarg, Var) && (IsA(larg, Const) || IsA(larg, Param)))))
+				return false;
+		}
+
+		return true;
+	}
+
+	/* Arithmetic operators */
+	if (tclass != MONGO_TYPE_NUMBER ||
+		mongo_type_class(oe->opresulttype) != MONGO_TYPE_NUMBER)
+		return false;
+
+	if (strcmp(oname, "/") == 0 &&
+		oe->opresulttype != FLOAT4OID && oe->opresulttype != FLOAT8OID)
+		return false;
+
+	return true;
+}
+
+/*
+ * mongo_is_shippable_aggref
+ *		Check whether MongoDB can compute the given aggregate the same way as
+ *		PostgreSQL does.
+ */
+static bool
+mongo_is_shippable_aggref(Aggref *agg, const char *func_name)
+{
+	Node	   *arg;
+	MongoTypeClass tclass;
+
+	/*
+	 * COUNT(*) only.  There is no syntax in MongoDB to count the non-null
+	 * values of a particular column.
+	 */
+	if (strcmp(func_name, "count") == 0)
+		return agg->args == NIL;
+
+	if (list_length(agg->args) != 1)
+		return false;
+
+	arg = (Node *) linitial(agg->args);
+	if (IsA(arg, TargetEntry))
+		arg = (Node *) ((TargetEntry *) arg)->expr;
+	tclass = mongo_type_class(exprType(arg));
+
+	if (strcmp(func_name, "sum") == 0 || strcmp(func_name, "avg") == 0)
+		return tclass == MONGO_TYPE_NUMBER;
+
+	if (strcmp(func_name, "min") == 0 || strcmp(func_name, "max") == 0)
+	{
+		if (tclass == MONGO_TYPE_NONE || tclass == MONGO_TYPE_BOOL)
+			return false;
+
+		/* Strings are compared bytewise, see foreign_expr_walker() */
+		if (OidIsValid(agg->inputcollid) &&
+			!mongo_collation_is_c(agg->inputcollid))
+			return false;
+
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * mongo_type_class
+ *		Return the class of values that the given PostgreSQL type can be
+ *		compared with on the MongoDB side.
+ */
+MongoTypeClass
+mongo_type_class(Oid typid)
+{
+	switch (typid)
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+		case NUMERICOID:
+			return MONGO_TYPE_NUMBER;
+		case BOOLOID:
+			return MONGO_TYPE_BOOL;
+		case TEXTOID:
+		case VARCHAROID:
+		case BPCHAROID:
+		case NAMEOID:
+			return MONGO_TYPE_STRING;
+		case DATEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return MONGO_TYPE_DATE;
+		default:
+			return MONGO_TYPE_NONE;
+	}
+}
+
+/*
+ * mongo_parse_objectid
+ *		Check whether the given string is the canonical (24 lowercase hex
+ *		digits) representation of an ObjectId, and if so, convert it.
+ *
+ * Only the canonical form is accepted because that is how mongo_fdw presents
+ * ObjectIds, so it is the only form that compares equal to them in
+ * PostgreSQL.
+ */
+bool
+mongo_parse_objectid(const char *str, bson_oid_t *oid)
+{
+	int			i;
+
+	for (i = 0; i < 24; i++)
+	{
+		if (!((str[i] >= '0' && str[i] <= '9') ||
+			  (str[i] >= 'a' && str[i] <= 'f')))
+			return false;
+	}
+
+	if (str[24] != '\0')
+		return false;
+
+	bson_oid_init_from_string(oid, str);
+
+	return true;
+}
+
+/*
+ * mongo_append_type_check
+ *		Append an expression that is true only if 'field' holds a BSON value
+ *		that mongo_fdw converts to the PostgreSQL type 'typid', rather than to
+ *		NULL.
+ *
+ * This is how the pushed-down conditions ignore missing fields, nulls, and
+ * values of other types, which PostgreSQL sees as NULL.  (MongoDB doesn't: it
+ * orders values of different types, so e.g. "10" > 5, and a missing field
+ * isn't equal to null.)  This doesn't prevent MongoDB from using an index for
+ * the condition it accompanies.
+ */
+void
+mongo_append_type_check(BSON *doc, const char *key, const char *field,
+						Oid typid)
+{
+	static const char *const numberTypes[] = {"int", "long", "double", NULL};
+	static const char *const boolTypes[] = {"bool", NULL};
+	static const char *const stringTypes[] = {"string", "objectId", NULL};
+	static const char *const dateTypes[] = {"date", NULL};
+	const char *const *types;
+	BSON		expr;
+	BSON		args;
+	BSON		type_expr;
+
+	switch (mongo_type_class(typid))
+	{
+		case MONGO_TYPE_NUMBER:
+			types = numberTypes;
+			break;
+		case MONGO_TYPE_BOOL:
+			types = boolTypes;
+			break;
+		case MONGO_TYPE_STRING:
+			types = stringTypes;
+			break;
+		case MONGO_TYPE_DATE:
+			types = dateTypes;
+			break;
+		default:
+			elog(ERROR, "unexpected type %u in pushed-down expression", typid);
+			types = NULL;		/* keep compiler quiet */
+	}
+
+	/* {"$in": [{"$type": field}, [types...]]} or {"$eq": [..., type]} */
+	bsonAppendStartObject(doc, (char *) key, &expr);
+	bsonAppendStartArray(&expr, types[1] ? "$in" : "$eq", &args);
+	bsonAppendStartObject(&args, "0", &type_expr);
+	bsonAppendUTF8(&type_expr, "$type", (char *) field);
+	bsonAppendFinishObject(&args, &type_expr);
+	if (types[1])
+	{
+		BSON		names;
+		int			i;
+
+		bsonAppendStartArray(&args, "1", &names);
+		for (i = 0; types[i]; i++)
+			bsonAppendUTF8(&names, psprintf("%d", i), (char *) types[i]);
+		bsonAppendFinishArray(&args, &names);
+	}
+	else
+		bsonAppendUTF8(&args, "1", (char *) types[0]);
+	bsonAppendFinishArray(&expr, &args);
+	bsonAppendFinishObject(doc, &expr);
+}
+
+/*
+ * mongo_append_typed_value
+ *		Append an expression that yields the value of 'field' as PostgreSQL
+ *		would see it when reading it as type 'typid': NULL unless the field
+ *		holds a value of a compatible BSON type, and ObjectIds of a string
+ *		column as their hex strings.
+ *
+ * This is used for GROUP BY columns and aggregate inputs, which can't use an
+ * index anyway.
+ */
+void
+mongo_append_typed_value(BSON *doc, const char *key, const char *field,
+						 Oid typid)
+{
+	BSON		expr;
+	BSON		cond;
+
+	bsonAppendStartObject(doc, (char *) key, &expr);
+	bsonAppendStartArray(&expr, "$cond", &cond);
+
+	if (mongo_type_class(typid) == MONGO_TYPE_STRING)
+	{
+		BSON		is_string;
+		BSON		is_string_args;
+		BSON		type_expr;
+		BSON		oid_expr;
+		BSON		oid_cond;
+		BSON		is_oid;
+		BSON		is_oid_args;
+		BSON		to_string;
+
+		/* [{$eq: [{$type: F}, "string"]}, F, <ObjectId as string or null>] */
+		bsonAppendStartObject(&cond, "0", &is_string);
+		bsonAppendStartArray(&is_string, "$eq", &is_string_args);
+		bsonAppendStartObject(&is_string_args, "0", &type_expr);
+		bsonAppendUTF8(&type_expr, "$type", (char *) field);
+		bsonAppendFinishObject(&is_string_args, &type_expr);
+		bsonAppendUTF8(&is_string_args, "1", "string");
+		bsonAppendFinishArray(&is_string, &is_string_args);
+		bsonAppendFinishObject(&cond, &is_string);
+
+		bsonAppendUTF8(&cond, "1", (char *) field);
+
+		/* {$cond: [{$eq: [{$type: F}, "objectId"]}, {$toString: F}, null]} */
+		bsonAppendStartObject(&cond, "2", &oid_expr);
+		bsonAppendStartArray(&oid_expr, "$cond", &oid_cond);
+		bsonAppendStartObject(&oid_cond, "0", &is_oid);
+		bsonAppendStartArray(&is_oid, "$eq", &is_oid_args);
+		bsonAppendStartObject(&is_oid_args, "0", &type_expr);
+		bsonAppendUTF8(&type_expr, "$type", (char *) field);
+		bsonAppendFinishObject(&is_oid_args, &type_expr);
+		bsonAppendUTF8(&is_oid_args, "1", "objectId");
+		bsonAppendFinishArray(&is_oid, &is_oid_args);
+		bsonAppendFinishObject(&oid_cond, &is_oid);
+		bsonAppendStartObject(&oid_cond, "1", &to_string);
+		bsonAppendUTF8(&to_string, "$toString", (char *) field);
+		bsonAppendFinishObject(&oid_cond, &to_string);
+		bsonAppendNull(&oid_cond, "2");
+		bsonAppendFinishArray(&oid_expr, &oid_cond);
+		bsonAppendFinishObject(&cond, &oid_expr);
+	}
+	else
+	{
+		/* [<type check>, F, null] */
+		mongo_append_type_check(&cond, "0", field, typid);
+		bsonAppendUTF8(&cond, "1", (char *) field);
+		bsonAppendNull(&cond, "2");
+	}
+
+	bsonAppendFinishArray(&expr, &cond);
+	bsonAppendFinishObject(doc, &expr);
+}
+
+/*
+ * mongo_append_id_filter
+ *		Append a query filter on the given key matching the given row
+ *		identifier value, as read from a document by mongo_fdw.
+ *
+ * mongo_fdw presents both ObjectIds and strings as strings, so a value that
+ * looks like an ObjectId may have come from either.
+ */
+void
+mongo_append_id_filter(BSON *doc, const char *key, Datum value, bool isnull,
+					   Oid typid)
+{
+	char	   *str;
+	bson_oid_t	oid;
+
+	if (isnull || mongo_type_class(typid) != MONGO_TYPE_STRING)
+	{
+		append_mongo_value(doc, key, value, isnull, typid);
+		return;
+	}
+
+	if (typid == NAMEOID)
+		str = NameStr(*DatumGetName(value));
+	else
+		str = TextDatumGetCString(value);
+
+	if (mongo_parse_objectid(str, &oid))
+	{
+		/* {key: {"$in": [ObjectId, "hex"]}} */
+		BSON		cond;
+		BSON		values;
+
+		bsonAppendStartObject(doc, (char *) key, &cond);
+		bsonAppendStartArray(&cond, "$in", &values);
+		bsonAppendOid(&values, "0", &oid);
+		bsonAppendUTF8(&values, "1", str);
+		bsonAppendFinishArray(&cond, &values);
+		bsonAppendFinishObject(doc, &cond);
+	}
+	else
+		bsonAppendUTF8(doc, key, str);
+}
+
+/*
+ * mongo_collation_is_c
+ *		Does the given collation order strings bytewise, as MongoDB does?
+ */
+bool
+mongo_collation_is_c(Oid collid)
+{
+	if (collid == C_COLLATION_OID)
+		return true;
+#ifdef POSIX_COLLATION_OID
+	if (collid == POSIX_COLLATION_OID)
+		return true;
+#endif
+
+#if PG_VERSION_NUM >= 180000
+	return pg_newlocale_from_collation(collid)->collate_is_c;
+#else
+	return lc_collate_is_c(collid);
+#endif
+}
+
+/*
+ * mongo_is_unsafe_column_name
+ *		Returns true if a column of the given name can't be referenced in a
+ *		MongoDB aggregation expression.
+ *
+ * MongoDB allows storing fields whose names start with a dollar sign, but
+ * interprets such field paths (e.g. "$field" or "nested.$field") as operators
+ * or variables.  Operations on such columns are evaluated locally instead.
+ */
+bool
+mongo_is_unsafe_column_name(const char *colname)
+{
+	return colname[0] == '$' || strstr(colname, ".$") != NULL;
 }
 
 /*

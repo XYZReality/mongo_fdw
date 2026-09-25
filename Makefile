@@ -26,7 +26,7 @@ OBJS = connection.o option.o mongo_wrapper.o mongo_fdw.o mongo_query.o deparse.o
 EXTENSION = mongo_fdw
 DATA = mongo_fdw--1.0.sql  mongo_fdw--1.1.sql mongo_fdw--1.0--1.1.sql
 
-REGRESS = server_options connection_validation dml select pushdown join_pushdown aggregate_pushdown limit_offset_pushdown
+REGRESS = server_options connection_validation dml select pushdown join_pushdown aggregate_pushdown limit_offset_pushdown pushdown_semantics
 REGRESS_OPTS = --load-extension=$(EXTENSION)
 
 ifdef USE_PGXS

@@ -160,9 +160,14 @@ mongo_option_names_string(Oid currentContextId)
  *
  * To resolve these values, the function checks the foreign table's options,
  * and if not present, falls back to default values.
+ *
+ * The credentials are taken from the user mapping of 'userid', which must be
+ * the same user the connection is made as (see mongo_get_connection).  If
+ * 'userid' is InvalidOid, no user mapping is looked up, which is enough when
+ * no connection is to be made.
  */
 MongoFdwOptions *
-mongo_get_options(Oid foreignTableId)
+mongo_get_options(Oid foreignTableId, Oid userid)
 {
 	ForeignTable *foreignTable;
 	ForeignServer *foreignServer;
@@ -173,11 +178,13 @@ mongo_get_options(Oid foreignTableId)
 
 	foreignTable = GetForeignTable(foreignTableId);
 	foreignServer = GetForeignServer(foreignTable->serverid);
-	mapping = GetUserMapping(GetUserId(), foreignTable->serverid);
-
 	optionList = mongo_list_concat(optionList, foreignServer->options);
 	optionList = mongo_list_concat(optionList, foreignTable->options);
-	optionList = mongo_list_concat(optionList, mapping->options);
+	if (OidIsValid(userid))
+	{
+		mapping = GetUserMapping(userid, foreignTable->serverid);
+		optionList = mongo_list_concat(optionList, mapping->options);
+	}
 
 	options = (MongoFdwOptions *) palloc0(sizeof(MongoFdwOptions));
 

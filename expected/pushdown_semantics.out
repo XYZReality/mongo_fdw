@@ -1,0 +1,402 @@
+\set MONGO_HOST			`echo \'"$MONGO_HOST"\'`
+\set MONGO_PORT			`echo \'"$MONGO_PORT"\'`
+\set MONGO_USER_NAME	`echo \'"$MONGO_USER_NAME"\'`
+\set MONGO_PASS			`echo \'"$MONGO_PWD"\'`
+-- Before running this file user must create database mongo_fdw_regress on
+-- MongoDB with all permission for MONGO_USER_NAME user with MONGO_PASS
+-- password and ran mongodb_init.sh file to load collections.
+-- Pushed-down operations must give the same results as evaluating them
+-- locally, even where MongoDB's semantics differ from PostgreSQL's.
+\c contrib_regression
+CREATE EXTENSION IF NOT EXISTS mongo_fdw;
+CREATE SERVER mongo_server FOREIGN DATA WRAPPER mongo_fdw
+  OPTIONS (address :MONGO_HOST, port :MONGO_PORT);
+CREATE USER MAPPING FOR public SERVER mongo_server;
+-- The test_semantics collection holds ObjectId and string _ids, and fields
+-- that are missing, null, or of a type other than the column's.
+CREATE FOREIGN TABLE sem_name (_id NAME, g int, n int, s text, b bool, x int)
+  SERVER mongo_server OPTIONS (database 'mongo_fdw_regress', collection 'test_semantics');
+CREATE FOREIGN TABLE sem_text (_id text, g int)
+  SERVER mongo_server OPTIONS (database 'mongo_fdw_regress', collection 'test_semantics');
+CREATE FOREIGN TABLE sem_empty (_id NAME, a int)
+  SERVER mongo_server OPTIONS (database 'mongo_fdw_regress', collection 'test_semantics_empty');
+--
+-- ObjectIds
+--
+-- ObjectIds and strings are both presented as strings.
+SELECT _id, g FROM sem_name ORDER BY g, _id COLLATE "C";
+           _id            | g 
+--------------------------+---
+ 62b597048a7fca1c83fc4eea | 1
+ 62b597048a7fca1c83fc4eeb | 1
+ 62b597048a7fca1c83fc4eec | 2
+ plain-string-id          | 2
+ $dollar                  | 3
+(5 rows)
+
+SELECT _id, g FROM sem_text ORDER BY g, _id COLLATE "C";
+           _id            | g 
+--------------------------+---
+ 62b597048a7fca1c83fc4eea | 1
+ 62b597048a7fca1c83fc4eeb | 1
+ 62b597048a7fca1c83fc4eec | 2
+ plain-string-id          | 2
+ $dollar                  | 3
+(5 rows)
+
+-- A value that is an ObjectId string matches the ObjectId, whatever the type
+-- of the value (name, text, or a text parameter).
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT g FROM sem_name WHERE _id = '62b597048a7fca1c83fc4eea';
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Foreign Scan on public.sem_name
+   Output: g
+   Foreign Namespace: mongo_fdw_regress.test_semantics
+(3 rows)
+
+SELECT g FROM sem_name WHERE _id = '62b597048a7fca1c83fc4eea';
+ g 
+---
+ 1
+(1 row)
+
+SELECT g FROM sem_name WHERE _id = '62b597048a7fca1c83fc4eea'::text;
+ g 
+---
+ 1
+(1 row)
+
+SELECT g FROM sem_text WHERE _id = '62b597048a7fca1c83fc4eea';
+ g 
+---
+ 1
+(1 row)
+
+PREPARE by_id(text) AS SELECT g FROM sem_name WHERE _id = $1;
+EXECUTE by_id('62b597048a7fca1c83fc4eeb');
+ g 
+---
+ 1
+(1 row)
+
+EXECUTE by_id('plain-string-id');
+ g 
+---
+ 2
+(1 row)
+
+EXECUTE by_id(NULL);
+ g 
+---
+(0 rows)
+
+DEALLOCATE by_id;
+-- Strings still match strings, including ones starting with "$".
+SELECT g FROM sem_text WHERE _id = 'plain-string-id';
+ g 
+---
+ 2
+(1 row)
+
+SELECT g FROM sem_text WHERE _id = '$dollar';
+ g 
+---
+ 3
+(1 row)
+
+SELECT g FROM sem_name WHERE s = '$s';
+ g 
+---
+ 3
+(1 row)
+
+SELECT count(*) FROM sem_name WHERE _id <> '62b597048a7fca1c83fc4eea';
+ count 
+-------
+     4
+(1 row)
+
+-- The pushed-down query compares with both the string and the ObjectId.
+SET mongo_fdw.log_remote_query TO true;
+SET client_min_messages TO log;
+SELECT g FROM sem_text WHERE _id = '62b597048a7fca1c83fc4eea';
+LOG:  remote query: db.test_semantics.aggregate( [ { "$match" : { "$expr" : { "$and" : [ { "$or" : [ { "$eq" : [ "$_id", "62b597048a7fca1c83fc4eea" ] }, { "$eq" : [ "$_id", { "$oid" : "62b597048a7fca1c83fc4eea" } ] } ] } ] } } } ] )
+ g 
+---
+ 1
+(1 row)
+
+RESET client_min_messages;
+RESET mongo_fdw.log_remote_query;
+-- UPDATE and DELETE find documents by either kind of _id.
+UPDATE sem_name SET g = g WHERE _id = '62b597048a7fca1c83fc4eec';
+UPDATE sem_name SET g = g WHERE _id = 'plain-string-id';
+UPDATE sem_text SET g = g WHERE _id = '62b597048a7fca1c83fc4eea';
+--
+-- Missing, null, and mistyped fields don't match, as they are NULL here.
+--
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT n FROM sem_name WHERE n < 5 ORDER BY n;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Sort
+   Output: n
+   Sort Key: sem_name.n
+   ->  Foreign Scan on public.sem_name
+         Output: n
+         Foreign Namespace: mongo_fdw_regress.test_semantics
+(6 rows)
+
+SELECT n FROM sem_name WHERE n < 5 ORDER BY n;
+ n  
+----
+ -4
+  3
+  4
+(3 rows)
+
+SELECT count(*) FROM sem_name WHERE n > 1;
+ count 
+-------
+     2
+(1 row)
+
+SELECT count(*) FROM sem_name WHERE n <> 3;
+ count 
+-------
+     2
+(1 row)
+
+SELECT g FROM sem_name WHERE x < 1;
+ g 
+---
+(0 rows)
+
+SELECT b FROM sem_name WHERE b;
+ b 
+---
+ t
+(1 row)
+
+SELECT b FROM sem_name WHERE NOT b;
+ b 
+---
+ f
+(1 row)
+
+SELECT count(*) FROM sem_name WHERE NOT (n > 1 OR g = 3);
+ count 
+-------
+     0
+(1 row)
+
+--
+-- Operators that MongoDB evaluates differently are evaluated locally.
+--
+-- Integer division truncates in PostgreSQL but not in MongoDB.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT n FROM sem_name WHERE n / 2 = 1;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Foreign Scan on public.sem_name
+   Output: n
+   Filter: ((sem_name.n / 2) = 1)
+   Foreign Namespace: mongo_fdw_regress.test_semantics
+(4 rows)
+
+SELECT n FROM sem_name WHERE n / 2 = 1;
+ n 
+---
+ 3
+(1 row)
+
+-- MongoDB orders strings bytewise, which only matches the "C" collation.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT s FROM sem_name ORDER BY s COLLATE "en_US" NULLS FIRST;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Sort
+   Output: s, ((s)::text)
+   Sort Key: sem_name.s COLLATE "en_US" NULLS FIRST
+   ->  Foreign Scan on public.sem_name
+         Output: s, s
+         Foreign Namespace: mongo_fdw_regress.test_semantics
+(6 rows)
+
+SELECT s FROM sem_name ORDER BY s COLLATE "en_US" NULLS FIRST;
+  s  
+-----
+ $s
+ a
+ abc
+ B
+ Z
+(5 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT s FROM sem_name ORDER BY s COLLATE "C" NULLS FIRST;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Foreign Scan on public.sem_name
+   Output: s, s
+   Foreign Namespace: mongo_fdw_regress.test_semantics
+(3 rows)
+
+SELECT s FROM sem_name ORDER BY s COLLATE "C" NULLS FIRST;
+  s  
+-----
+ $s
+ B
+ Z
+ a
+ abc
+(5 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT s FROM sem_name WHERE s COLLATE "C" < 'a' ORDER BY 1;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Sort
+   Output: s
+   Sort Key: sem_name.s
+   ->  Foreign Scan on public.sem_name
+         Output: s
+         Foreign Namespace: mongo_fdw_regress.test_semantics
+(6 rows)
+
+SELECT s FROM sem_name WHERE s COLLATE "C" < 'a' ORDER BY 1;
+ s  
+----
+ $s
+ B
+ Z
+(3 rows)
+
+-- Errors raised by MongoDB are reported, rather than ending the scan early.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT n FROM sem_name WHERE n % 0 = 1;
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Foreign Scan on public.sem_name
+   Output: n
+   Foreign Namespace: mongo_fdw_regress.test_semantics
+(3 rows)
+
+SELECT n FROM sem_name WHERE n % 0 = 1;
+ERROR:  could not iterate over mongo collection
+HINT:  Mongo error: "PlanExecutor error during aggregation :: caused by :: can't $mod by zero"
+--
+-- Aggregates
+--
+-- An aggregate without GROUP BY returns a row even if there is no input.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM sem_name WHERE g = 99;
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Foreign Scan
+   Output: (count(*))
+   Foreign Namespace: Aggregate on (mongo_fdw_regress.test_semantics sem_name)
+(3 rows)
+
+SELECT count(*) FROM sem_name WHERE g = 99;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*), sum(a), min(a), avg(a) FROM sem_empty;
+ count | sum | min | avg 
+-------+-----+-----+-----
+     0 |     |     |    
+(1 row)
+
+SELECT count(*) FROM sem_empty HAVING count(*) = 0;
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM sem_empty LIMIT 1 OFFSET 1;
+ count 
+-------
+(0 rows)
+
+-- SUM() of no non-null input is NULL; values of other types are ignored.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT g, sum(x), sum(n), max(n) FROM sem_name GROUP BY g ORDER BY g;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Sort
+   Output: g, (sum(x)), (sum(n)), (max(n))
+   Sort Key: sem_name.g
+   ->  Foreign Scan
+         Output: g, (sum(x)), (sum(n)), (max(n))
+         Foreign Namespace: Aggregate on (mongo_fdw_regress.test_semantics sem_name)
+(6 rows)
+
+SELECT g, sum(x), sum(n), max(n) FROM sem_name GROUP BY g ORDER BY g;
+ g | sum | sum | max 
+---+-----+-----+-----
+ 1 |     |   3 |   3
+ 2 |     |   4 |   4
+ 3 |     |  -4 |  -4
+(3 rows)
+
+-- Missing and mistyped values group with nulls.
+SELECT n, count(*) FROM sem_name GROUP BY n ORDER BY n;
+ n  | count 
+----+-------
+ -4 |     1
+  3 |     1
+  4 |     1
+    |     2
+(4 rows)
+
+-- Several aggregates in HAVING.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT g FROM sem_name GROUP BY g HAVING min(n) > 2 AND max(n) < 4 ORDER BY g;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Sort
+   Output: g
+   Sort Key: sem_name.g
+   ->  Foreign Scan
+         Output: g
+         Foreign Namespace: Aggregate on (mongo_fdw_regress.test_semantics sem_name)
+(6 rows)
+
+SELECT g FROM sem_name GROUP BY g HAVING min(n) > 2 AND max(n) < 4 ORDER BY g;
+ g 
+---
+ 1
+(1 row)
+
+SELECT g FROM sem_name GROUP BY g HAVING min(n) < 4 ORDER BY g;
+ g 
+---
+ 1
+ 3
+(2 rows)
+
+--
+-- LIMIT
+--
+SELECT g FROM sem_name ORDER BY g LIMIT 0;
+ g 
+---
+(0 rows)
+
+SELECT count(*) FROM (SELECT g FROM sem_name ORDER BY g LIMIT 3000000000) x;
+ count 
+-------
+     5
+(1 row)
+
+-- Cleanup
+DROP FOREIGN TABLE sem_name;
+DROP FOREIGN TABLE sem_text;
+DROP FOREIGN TABLE sem_empty;
+DROP USER MAPPING FOR public SERVER mongo_server;
+DROP SERVER mongo_server;
+DROP EXTENSION mongo_fdw;

@@ -23,12 +23,30 @@ typedef struct pipeline_cxt
 	struct HTAB *colInfoHash;	/* columns information hash */
 	unsigned int arrayIndex;	/* Index of the various arrays in the
 								 * pipeline, starting from zero */
-	bool		isBoolExpr;		/* is join expression boolean? */
-	bool		isJoinClause;	/* is join clause? This is to add null check
-								 * only in case of join clause */
-	uint32		opExprCount;	/* count death of the expression */
+	bool		isJoinClause;	/* is join clause?  Columns of the outer
+								 * relation are then referenced through $lookup
+								 * variables */
+	bool		isHaving;		/* is HAVING clause?  Columns then refer to the
+								 * group keys, and aggregates to the HAVING
+								 * results of the $group stage */
+	uint32		havingAggIndex; /* number of the next HAVING aggregate */
+	uint32		opExprCount;	/* depth of the operator expression */
 	ForeignScanState *scanStateNode;	/* To evaluate param expression */
 } pipeline_cxt;
+
+/*
+ * Classes of PostgreSQL data types that can be compared on the MongoDB side.
+ * Each class corresponds to the set of BSON types that mongo_fdw converts to
+ * the PostgreSQL type when fetching (see column_types_compatible()).
+ */
+typedef enum MongoTypeClass
+{
+	MONGO_TYPE_NONE,			/* not pushable */
+	MONGO_TYPE_NUMBER,			/* int2, int4, int8, float4, float8, numeric */
+	MONGO_TYPE_BOOL,			/* boolean */
+	MONGO_TYPE_STRING,			/* text, varchar, bpchar, name */
+	MONGO_TYPE_DATE				/* date, timestamp, timestamptz */
+} MongoTypeClass;
 
 /*
  * ColInfoEntry represents a hash table entry that maps a unique column's varno
@@ -139,10 +157,24 @@ extern void append_constant_value(BSON *queryDocument, const char *keyName,
 								  Const *constant);
 extern void mongo_append_expr(Expr *node, BSON *child_doc,
 							  pipeline_cxt *context);
+extern void mongo_append_clause(Expr *node, BSON *child_doc,
+								pipeline_cxt *context);
 extern void append_param_value(BSON *queryDocument, const char *keyName,
 							   Param *paramNode,
 							   ForeignScanState *scanStateNode);
 extern char *get_varname_for_outer_col(const char *str);
 extern void mongo_replace_char(char* str, char find, char replace);
+
+/* Type and value helpers shared by mongo_query.c, deparse.c and mongo_fdw.c */
+extern MongoTypeClass mongo_type_class(Oid typid);
+extern bool mongo_parse_objectid(const char *str, bson_oid_t *oid);
+extern void mongo_append_type_check(BSON *doc, const char *key,
+									const char *field, Oid typid);
+extern void mongo_append_typed_value(BSON *doc, const char *key,
+									 const char *field, Oid typid);
+extern void mongo_append_id_filter(BSON *doc, const char *key, Datum value,
+								   bool isnull, Oid typid);
+extern bool mongo_collation_is_c(Oid collid);
+extern bool mongo_is_unsafe_column_name(const char *colname);
 
 #endif							/* MONGO_QUERY_H */

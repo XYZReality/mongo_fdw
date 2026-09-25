@@ -23,6 +23,8 @@ db.test4.drop();
 db.mongo_test.drop();
 db.test5.drop();
 db.test_special_floats.drop();
+db.test_semantics.drop();
+db.test_semantics_empty.drop();
 // Below queries will create and insert values in collections
 db.mongo_test.insert({a : NumberInt(0), b : "mongo_test collection"});
 db.test_tbl2.insertMany([
@@ -160,4 +162,13 @@ db.test_special_floats.insertMany([
 	{_id: NumberInt(31), value: 2147483647.6},     // Rounds up past INT32_MAX, errors
 	{_id: NumberInt(32), value: 2.5},              // Round-half-to-even -> 2
 	{_id: NumberInt(33), value: 3.5}               // Round-half-to-even -> 4
+]);
+// Documents for the pushdown_semantics test: ObjectId and string _ids, and
+// fields that are missing, null, or of a type that doesn't match the column.
+db.test_semantics.insertMany([
+	{_id: ObjectId("62b597048a7fca1c83fc4eea"), g: NumberInt(1), n: NumberInt(3), s: "abc", b: true, x: null},
+	{_id: ObjectId("62b597048a7fca1c83fc4eeb"), g: NumberInt(1), n: "10", s: "B", b: false},
+	{_id: ObjectId("62b597048a7fca1c83fc4eec"), g: NumberInt(2), s: "a", x: null},
+	{_id: "plain-string-id", g: NumberInt(2), n: NumberInt(4), s: "Z", b: null, x: null},
+	{_id: "$dollar", g: NumberInt(3), n: NumberInt(-4), s: "$s"}
 ]);

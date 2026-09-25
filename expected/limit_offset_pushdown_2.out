@@ -89,12 +89,17 @@ SET mongo_fdw.enable_order_by_pushdown TO ON;
 -- Only limit should get pushdown.
 EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 2 DESC NULLS LAST LIMIT 3;
-                    QUERY PLAN                    
---------------------------------------------------
- Foreign Scan on public.fdw131_t1
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Limit
    Output: c1, c2, c3
-   Foreign Namespace: mongo_fdw_regress.test_tbl2
-(3 rows)
+   ->  Sort
+         Output: c1, c2, c3
+         Sort Key: fdw131_t1.c2 DESC NULLS LAST
+         ->  Foreign Scan on public.fdw131_t1
+               Output: c1, c2, c3
+               Foreign Namespace: mongo_fdw_regress.test_tbl2
+(8 rows)
 
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 2 DESC NULLS LAST LIMIT 3;
  c1 |     c2      |   c3   
@@ -107,12 +112,17 @@ SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 2 DESC NULLS LAST LIMIT 3;
 -- Expression in limit clause. Should get pushdown.
 EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 DESC NULLS LAST LIMIT round(3.2) OFFSET 2;
-                    QUERY PLAN                    
---------------------------------------------------
- Foreign Scan on public.fdw131_t1
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Limit
    Output: c1, c2, c3
-   Foreign Namespace: mongo_fdw_regress.test_tbl2
-(3 rows)
+   ->  Sort
+         Output: c1, c2, c3
+         Sort Key: fdw131_t1.c3 DESC NULLS LAST
+         ->  Foreign Scan on public.fdw131_t1
+               Output: c1, c2, c3
+               Foreign Namespace: mongo_fdw_regress.test_tbl2
+(8 rows)
 
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 DESC NULLS LAST LIMIT round(3.2) OFFSET 2;
  c1 |       c2       |    c3    
@@ -124,12 +134,17 @@ SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 DESC NULLS LAST LIMIT round(3.2) OFF
 -- Only Offset without limit should get pushdown.
 EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 ASC NULLS FIRST OFFSET 2;
-                    QUERY PLAN                    
---------------------------------------------------
- Foreign Scan on public.fdw131_t1
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Limit
    Output: c1, c2, c3
-   Foreign Namespace: mongo_fdw_regress.test_tbl2
-(3 rows)
+   ->  Sort
+         Output: c1, c2, c3
+         Sort Key: fdw131_t1.c3 NULLS FIRST
+         ->  Foreign Scan on public.fdw131_t1
+               Output: c1, c2, c3
+               Foreign Namespace: mongo_fdw_regress.test_tbl2
+(8 rows)
 
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 ASC NULLS FIRST OFFSET 2;
  c1 |     c2      |   c3   
@@ -178,12 +193,15 @@ SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 1 ASC NULLS FIRST LIMIT ALL OFFSET 1;
 -- Limit NULL
 EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 ASC NULLS FIRST LIMIT NULL;
-                    QUERY PLAN                    
---------------------------------------------------
- Foreign Scan on public.fdw131_t1
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Sort
    Output: c1, c2, c3
-   Foreign Namespace: mongo_fdw_regress.test_tbl2
-(3 rows)
+   Sort Key: fdw131_t1.c3 NULLS FIRST
+   ->  Foreign Scan on public.fdw131_t1
+         Output: c1, c2, c3
+         Foreign Namespace: mongo_fdw_regress.test_tbl2
+(6 rows)
 
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 ASC NULLS FIRST LIMIT NULL;
  c1 |       c2       |    c3    
@@ -196,12 +214,17 @@ SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 ASC NULLS FIRST LIMIT NULL;
 
 EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 ASC NULLS FIRST LIMIT NULL OFFSET 2;
-                    QUERY PLAN                    
---------------------------------------------------
- Foreign Scan on public.fdw131_t1
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Limit
    Output: c1, c2, c3
-   Foreign Namespace: mongo_fdw_regress.test_tbl2
-(3 rows)
+   ->  Sort
+         Output: c1, c2, c3
+         Sort Key: fdw131_t1.c3 NULLS FIRST
+         ->  Foreign Scan on public.fdw131_t1
+               Output: c1, c2, c3
+               Foreign Namespace: mongo_fdw_regress.test_tbl2
+(8 rows)
 
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 3 ASC NULLS FIRST LIMIT NULL OFFSET 2;
  c1 |     c2      |   c3   
@@ -242,12 +265,17 @@ SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 1 ASC NULLS FIRST LIMIT 0 OFFSET 0;
 -- Offset NULL.
 EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 2 ASC NULLS FIRST LIMIT 5 OFFSET NULL;
-                    QUERY PLAN                    
---------------------------------------------------
- Foreign Scan on public.fdw131_t1
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Limit
    Output: c1, c2, c3
-   Foreign Namespace: mongo_fdw_regress.test_tbl2
-(3 rows)
+   ->  Sort
+         Output: c1, c2, c3
+         Sort Key: fdw131_t1.c2 NULLS FIRST
+         ->  Foreign Scan on public.fdw131_t1
+               Output: c1, c2, c3
+               Foreign Namespace: mongo_fdw_regress.test_tbl2
+(8 rows)
 
 SELECT c1, c2, c3 FROM fdw131_t1 ORDER BY 2 ASC NULLS FIRST LIMIT 5 OFFSET NULL;
  c1 |       c2       |    c3    

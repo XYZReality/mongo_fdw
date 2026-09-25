@@ -165,10 +165,24 @@ SELECT a, b FROM f_mongo_test6 ORDER BY a;
 DELETE FROM f_mongo_test6 WHERE b[2] = 'DELETE';
 SELECT a, b FROM f_mongo_test6 ORDER BY a;
 
--- If first column type is not NAME then UPDATE/DELETE should result into an error.
+-- The first column may also be of type TEXT or VARCHAR, which presents
+-- ObjectIds as their hex strings.  UPDATE/DELETE should work.
 CREATE FOREIGN TABLE f_mongo_test7 (_id text, a int, b text) SERVER mongo_server
   OPTIONS (database 'mongo_fdw_regress', collection 'test_tbl7');
 SELECT a, b FROM f_mongo_test7 ORDER BY 1;
+SELECT length(_id) FROM f_mongo_test7 ORDER BY a;
+UPDATE f_mongo_test7 SET b = 'UPDATED' WHERE a = 10;
+SELECT a, b FROM f_mongo_test7 ORDER BY 1;
+UPDATE f_mongo_test7 SET b = 'ROW1' WHERE a = 10;
+INSERT INTO f_mongo_test7 (a, b) VALUES (30, 'ROW3');
+DELETE FROM f_mongo_test7 WHERE a = 30;
+SELECT a, b FROM f_mongo_test7 ORDER BY 1;
+DROP FOREIGN TABLE f_mongo_test7;
+
+-- If first column type can't present ObjectIds then UPDATE/DELETE should
+-- result into an error.
+CREATE FOREIGN TABLE f_mongo_test7 (_id int, a int, b text) SERVER mongo_server
+  OPTIONS (database 'mongo_fdw_regress', collection 'test_tbl7');
 UPDATE f_mongo_test7 SET b = 'UPDATED' WHERE a = 10;
 DELETE FROM f_mongo_test7 WHERE a = 10;
 DROP FOREIGN TABLE f_mongo_test7;

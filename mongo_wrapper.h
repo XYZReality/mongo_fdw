@@ -34,7 +34,7 @@ bool		mongoDelete(MONGO_CONN *conn, char *database, char *collection,
 MONGO_CURSOR *mongoCursorCreate(MONGO_CONN *conn, char *database,
 								char *collection, BSON *q);
 const BSON *mongoCursorBson(MONGO_CURSOR *c);
-bool		mongoCursorNext(MONGO_CURSOR *c, BSON *b);
+bool		mongoCursorNext(MONGO_CURSOR *c);
 void		mongoCursorDestroy(MONGO_CURSOR *c);
 double		mongoAggregateCount(MONGO_CONN *conn, const char *database,
 								const char *collection, const BSON *b);

@@ -47,6 +47,29 @@ server. By executing WHERE clauses directly on the foreign server, we
 significantly reduce data transfer to PostgreSQL, resulting in improved query
 performance.
 
+A pushed-down condition returns the same rows as evaluating it in
+PostgreSQL:
+
+  - A field that is missing, null, or holds a value of a type that
+    `mongo_fdw` doesn't convert to the column's type (and so shows as NULL)
+    doesn't match, just as a NULL doesn't in PostgreSQL.
+  - Operators are pushed down only where MongoDB computes the same result.
+    Integer and numeric division (`3 / 2` is `1` in PostgreSQL but `1.5` in
+    MongoDB), date/time arithmetic, and user-defined operators are evaluated
+    locally.
+  - MongoDB compares strings bytewise. Equality is pushed down under any
+    deterministic collation, but string ordering (`<`, `>`, ORDER BY,
+    `min()`/`max()`) only under the `"C"` collation, e.g.
+    `ORDER BY name COLLATE "C"`.
+
+#### ObjectIds
+SQL has no ObjectId type, so `mongo_fdw` presents ObjectIds as their 24-digit
+hex strings, in columns of type `name`, `text`, or `varchar`. A value that is
+a valid ObjectId string, e.g. in `WHERE _id = '62b597048a7fca1c83fc4eea'`, is
+compared both as a string and as an ObjectId on the MongoDB side, so it
+matches whichever the field holds. This also works for `text` parameters of
+prepared statements, and uses the index on the field.
+
 #### JOIN push-down
 `mongo_fdw` now also supports join push-down. The joins between two
 foreign tables from the same remote MongoDB server are pushed to a remote
@@ -328,7 +351,8 @@ All `CREATE FOREIGN TABLE` SQL commands can be executed as a normal PostgreSQL u
 Create a foreign table referencing the MongoDB collection:
 
 ```sql
--- Note: first column of the table must be "_id" of type "name".
+-- Note: first column of the table must be "_id", of type "name", "text", or
+-- "varchar".
 CREATE FOREIGN TABLE warehouse (
   _id name,
   warehouse_id int,
@@ -439,10 +463,19 @@ Limitations
     and re-install.
 
   - Column names containing a dollar sign (`$`) at the start or immediately following
-    a dot are not supported (e.g., `$field`, `nested.$field`). While MongoDB
-    allows storing these field names, they cannot be referenced in aggregation
-    pipeline expressions, causing queries to return empty results. Column names
-    with `$` in any other position (e.g., `field$name`, `col$`) function normally.
+    a dot (e.g., `$field`, `nested.$field`) can't be referenced in aggregation
+    pipeline expressions, so conditions, sorting, and aggregation on such
+    columns are evaluated locally. Column names with `$` in any other position
+    (e.g., `field$name`, `col$`) function normally.
+
+  - A pushed-down comparison between two columns (e.g. in a join) doesn't
+    consider an ObjectId equal to a string holding the same hex digits,
+    whereas PostgreSQL, which sees both as strings, does. Store references
+    with the same BSON type as the field they refer to.
+
+  - Pushed-down ORDER BY sorts values of mixed BSON types in MongoDB's type
+    order, which may differ from PostgreSQL's (which sees values it can't
+    convert as NULL).
 
   - When aggregate functions (e.g., `SUM`, `AVG`) over `SMALLINT`/`INTEGER`/
     `BIGINT` columns are pushed down to MongoDB, the `NaN`/`Infinity`

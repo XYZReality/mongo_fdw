@@ -21,6 +21,34 @@
 #define ITER_TYPE(i) ((bson_type_t) * ((i)->raw + (i)->type))
 
 /*
+ * mongo_uri_escape
+ *		Percent-encode a string for use as a component of a MongoDB URI.
+ *
+ * Only RFC 3986 unreserved characters are passed through, so that user names,
+ * passwords, and option values containing '@', ':', '/', '%', '&', etc. are
+ * neither misparsed nor able to inject extra URI options.
+ */
+static char *
+mongo_uri_escape(const char *str)
+{
+	StringInfoData buf;
+	const unsigned char *p;
+
+	initStringInfo(&buf);
+	for (p = (const unsigned char *) str; *p; p++)
+	{
+		if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+			(*p >= '0' && *p <= '9') ||
+			*p == '-' || *p == '.' || *p == '_' || *p == '~')
+			appendStringInfoChar(&buf, (char) *p);
+		else
+			appendStringInfo(&buf, "%%%02X", *p);
+	}
+
+	return buf.data;
+}
+
+/*
  * mongoConnect
  *		Connect to MongoDB server using Host/ip and Port number.
  */
@@ -28,131 +56,64 @@ MONGO_CONN *
 mongoConnect(MongoFdwOptions *opt)
 {
 	MONGO_CONN *client;
-	char	   *uri;
+	mongoc_uri_t *uri;
+	bson_error_t error;
+	StringInfoData uristr;
 
+	initStringInfo(&uristr);
+	appendStringInfoString(&uristr, "mongodb://");
 	if (opt->svr_username && opt->svr_password)
-	{
-		if (opt->authenticationDatabase)
-		{
-			if (opt->replicaSet)
-			{
-				if (opt->readPreference)
-					uri = bson_strdup_printf("mongodb://%s:%s@%s:%hu/%s?readPreference=%s&ssl=%s&authSource=%s&replicaSet=%s",
-											 opt->svr_username,
-											 opt->svr_password,
-											 opt->svr_address, opt->svr_port,
-											 opt->svr_database,
-											 opt->readPreference,
-											 opt->ssl ? "true" : "false",
-											 opt->authenticationDatabase,
-											 opt->replicaSet);
-				else
-					uri = bson_strdup_printf("mongodb://%s:%s@%s:%hu/%s?ssl=%s&authSource=%s&replicaSet=%s",
-											 opt->svr_username,
-											 opt->svr_password,
-											 opt->svr_address, opt->svr_port,
-											 opt->svr_database,
-											 opt->ssl ? "true" : "false",
-											 opt->authenticationDatabase,
-											 opt->replicaSet);
-			}
-			else if (opt->readPreference)
-				uri = bson_strdup_printf("mongodb://%s:%s@%s:%hu/%s?readPreference=%s&ssl=%s&authSource=%s",
-										 opt->svr_username, opt->svr_password,
-										 opt->svr_address, opt->svr_port,
-										 opt->svr_database,
-										 opt->readPreference,
-										 opt->ssl ? "true" : "false",
-										 opt->authenticationDatabase);
-			else
-				uri = bson_strdup_printf("mongodb://%s:%s@%s:%hu/%s?ssl=%s&authSource=%s",
-										 opt->svr_username, opt->svr_password,
-										 opt->svr_address, opt->svr_port,
-										 opt->svr_database,
-										 opt->ssl ? "true" : "false",
-										 opt->authenticationDatabase);
-		}
-		else if (opt->replicaSet)
-		{
-			if (opt->readPreference)
-				uri = bson_strdup_printf("mongodb://%s:%s@%s:%hu/%s?readPreference=%s&ssl=%s&replicaSet=%s",
-										 opt->svr_username, opt->svr_password,
-										 opt->svr_address, opt->svr_port,
-										 opt->svr_database,
-										 opt->readPreference,
-										 opt->ssl ? "true" : "false",
-										 opt->replicaSet);
-			else
-				uri = bson_strdup_printf("mongodb://%s:%s@%s:%hu/%s?ssl=%s&replicaSet=%s",
-										 opt->svr_username, opt->svr_password,
-										 opt->svr_address, opt->svr_port,
-										 opt->svr_database,
-										 opt->ssl ? "true" : "false",
-										 opt->replicaSet);
-		}
-		else if (opt->readPreference)
-			uri = bson_strdup_printf("mongodb://%s:%s@%s:%hu/%s?readPreference=%s&ssl=%s",
-									 opt->svr_username, opt->svr_password,
-									 opt->svr_address, opt->svr_port,
-									 opt->svr_database, opt->readPreference,
-									 opt->ssl ? "true" : "false");
-		else
-			uri = bson_strdup_printf("mongodb://%s:%s@%s:%hu/%s?ssl=%s",
-									 opt->svr_username, opt->svr_password,
-									 opt->svr_address,
-									 opt->svr_port, opt->svr_database,
-									 opt->ssl ? "true" : "false");
-	}
-	else if (opt->replicaSet)
-	{
-		if (opt->readPreference)
-			uri = bson_strdup_printf("mongodb://%s:%hu/%s?readPreference=%s&ssl=%s&replicaSet=%s",
-									 opt->svr_address, opt->svr_port,
-									 opt->svr_database, opt->readPreference,
-									 opt->ssl ? "true" : "false",
-									 opt->replicaSet);
-		else
-			uri = bson_strdup_printf("mongodb://%s:%hu/%s?ssl=%s&replicaSet=%s",
-									 opt->svr_address, opt->svr_port,
-									 opt->svr_database,
-									 opt->ssl ? "true" : "false",
-									 opt->replicaSet);
-	}
-	else if (opt->readPreference)
-		uri = bson_strdup_printf("mongodb://%s:%hu/%s?readPreference=%s&ssl=%s",
-								 opt->svr_address, opt->svr_port,
-								 opt->svr_database, opt->readPreference,
-								 opt->ssl ? "true" : "false");
-	else
-		uri = bson_strdup_printf("mongodb://%s:%hu/%s?ssl=%s",
-								 opt->svr_address, opt->svr_port,
-								 opt->svr_database,
-								 opt->ssl ? "true" : "false");
+		appendStringInfo(&uristr, "%s:%s@",
+						 mongo_uri_escape(opt->svr_username),
+						 mongo_uri_escape(opt->svr_password));
+	appendStringInfo(&uristr, "%s:%hu/%s?ssl=%s",
+					 opt->svr_address, opt->svr_port,
+					 mongo_uri_escape(opt->svr_database),
+					 opt->ssl ? "true" : "false");
+	if (opt->readPreference)
+		appendStringInfo(&uristr, "&readPreference=%s",
+						 mongo_uri_escape(opt->readPreference));
+	if (opt->authenticationDatabase)
+		appendStringInfo(&uristr, "&authSource=%s",
+						 mongo_uri_escape(opt->authenticationDatabase));
+	if (opt->replicaSet)
+		appendStringInfo(&uristr, "&replicaSet=%s",
+						 mongo_uri_escape(opt->replicaSet));
 
+	uri = mongoc_uri_new_with_error(uristr.data, &error);
 
-	client = mongoc_client_new(uri);
+	/* The URI may contain the password, so don't leave it lying around */
+	memset(uristr.data, 0, uristr.len);
+	pfree(uristr.data);
 
-	if (opt->ssl)
-	{
-		mongoc_ssl_opt_t *ssl_opts = (mongoc_ssl_opt_t *) malloc(sizeof(mongoc_ssl_opt_t));
+	if (uri == NULL)
+		ereport(ERROR,
+				(errmsg("could not connect to %s:%d", opt->svr_address,
+						opt->svr_port),
+				 errhint("Mongo error: \"%s\"", error.message)));
 
-		ssl_opts->pem_file = opt->pem_file;
-		ssl_opts->pem_pwd = opt->pem_pwd;
-		ssl_opts->ca_file = opt->ca_file;
-		ssl_opts->ca_dir = opt->ca_dir;
-		ssl_opts->crl_file = opt->crl_file;
-		ssl_opts->weak_cert_validation = opt->weak_cert_validation;
-		mongoc_client_set_ssl_opts(client, ssl_opts);
-		free(ssl_opts);
-	}
-
-	bson_free(uri);
+	client = mongoc_client_new_from_uri(uri);
+	mongoc_uri_destroy(uri);
 
 	if (client == NULL)
 		ereport(ERROR,
 				(errmsg("could not connect to %s:%d", opt->svr_address,
 						opt->svr_port),
 				 errhint("Mongo driver connection error.")));
+
+	if (opt->ssl)
+	{
+		/* Start from the driver defaults so that no field is left unset */
+		mongoc_ssl_opt_t ssl_opts = *mongoc_ssl_opt_get_default();
+
+		ssl_opts.pem_file = opt->pem_file;
+		ssl_opts.pem_pwd = opt->pem_pwd;
+		ssl_opts.ca_file = opt->ca_file;
+		ssl_opts.ca_dir = opt->ca_dir;
+		ssl_opts.crl_file = opt->crl_file;
+		ssl_opts.weak_cert_validation = opt->weak_cert_validation;
+		mongoc_client_set_ssl_opts(client, &ssl_opts);
+	}
 
 	return client;
 }
@@ -192,8 +153,27 @@ mongoInsert(MONGO_CONN *conn, char *database, char *collection, BSON *b)
 }
 
 /*
+ * reply_count
+ *		Extract an integer count field (e.g. "matchedCount") from a write
+ *		command reply.
+ */
+static int64
+reply_count(const BSON *reply, const char *field)
+{
+	bson_iter_t it;
+
+	if (bson_iter_init_find(&it, reply, field) && BSON_ITER_HOLDS_NUMBER(&it))
+		return bson_iter_as_int64(&it);
+
+	return 0;
+}
+
+/*
  * mongoUpdate
- *		Update a document 'b' into MongoDB.
+ *		Update the single document matching filter 'b' using update
+ *		document 'op'.
+ *
+ * Returns true if a document matched the filter.
  */
 bool
 mongoUpdate(MONGO_CONN *conn, char *database, char *collection, BSON *b,
@@ -201,48 +181,59 @@ mongoUpdate(MONGO_CONN *conn, char *database, char *collection, BSON *b,
 {
 	mongoc_collection_t *c;
 	bson_error_t error;
-	bool		r = false;
+	bson_t		reply;
+	bool		r;
+	int64		matched;
 
 	c = mongoc_client_get_collection(conn, database, collection);
 
-	r = mongoc_collection_update(c, MONGOC_UPDATE_NONE, b, op, NULL, &error);
+	r = mongoc_collection_update_one(c, b, op, NULL, &reply, &error);
 	mongoc_collection_destroy(c);
+	matched = reply_count(&reply, "matchedCount");
+	bson_destroy(&reply);
+
 	if (!r)
 		ereport(ERROR,
 				(errmsg("failed to update row"),
 				 errhint("Mongo error: \"%s\"", error.message)));
 
-	return true;
+	return matched > 0;
 }
 
 /*
  * mongoDelete
- *		Delete MongoDB's document.
+ *		Delete the single document matching filter 'b'.
+ *
+ * Returns true if a document was deleted.
  */
 bool
 mongoDelete(MONGO_CONN *conn, char *database, char *collection, BSON *b)
 {
 	mongoc_collection_t *c;
 	bson_error_t error;
-	bool		r = false;
+	bson_t		reply;
+	bool		r;
+	int64		deleted;
 
 	c = mongoc_client_get_collection(conn, database, collection);
 
-	r = mongoc_collection_remove(c, MONGOC_DELETE_SINGLE_REMOVE, b, NULL,
-								 &error);
+	r = mongoc_collection_delete_one(c, b, NULL, &reply, &error);
 	mongoc_collection_destroy(c);
+	deleted = reply_count(&reply, "deletedCount");
+	bson_destroy(&reply);
+
 	if (!r)
 		ereport(ERROR,
 				(errmsg("failed to delete row"),
 				 errhint("Mongo error: \"%s\"", error.message)));
 
-	return true;
+	return deleted > 0;
 }
 
 /*
  * mongoCursorCreate
  *		Performs a query against the configured MongoDB server and return
- *		cursor which can be destroyed by calling mongoc_cursor_current.
+ *		cursor which can be destroyed by calling mongoCursorDestroy.
  */
 MONGO_CURSOR *
 mongoCursorCreate(MONGO_CONN *conn, char *database, char *collection, BSON *q)
@@ -253,13 +244,15 @@ mongoCursorCreate(MONGO_CONN *conn, char *database, char *collection, BSON *q)
 
 	c = mongoc_client_get_collection(conn, database, collection);
 	cur = mongoc_collection_aggregate(c, MONGOC_QUERY_NONE, q, NULL, NULL);
-	mongoc_cursor_error(cur, &error);
-	if (!cur)
+	mongoc_collection_destroy(c);
+
+	if (mongoc_cursor_error(cur, &error))
+	{
+		mongoc_cursor_destroy(cur);
 		ereport(ERROR,
 				(errmsg("failed to create cursor"),
 				 errhint("Mongo error: \"%s\"", error.message)));
-
-	mongoc_collection_destroy(c);
+	}
 
 	return cur;
 }
@@ -287,30 +280,39 @@ mongoCursorBson(MONGO_CURSOR *c)
 
 /*
  * mongoCursorNext
- *		Get the next document from the cursor.
+ *		Advance the cursor to the next document, which can then be fetched
+ *		using mongoCursorBson().
+ *
+ * Returns false once the cursor is exhausted.  Any error raised by the server
+ * or the driver while iterating is reported rather than being mistaken for the
+ * end of the result set.
  */
 bool
-mongoCursorNext(MONGO_CURSOR *c, BSON *b)
+mongoCursorNext(MONGO_CURSOR *c)
 {
-	return mongoc_cursor_next(c, (const BSON **) &b);
+	const BSON *doc;
+	bson_error_t error;
+
+	if (mongoc_cursor_next(c, &doc))
+		return true;
+
+	if (mongoc_cursor_error(c, &error))
+		ereport(ERROR,
+				(errmsg("could not iterate over mongo collection"),
+				 errhint("Mongo error: \"%s\"", error.message)));
+
+	return false;
 }
 
 /*
  * bsonCreate
- *		Allocates a new bson_t structure, and also initialize the bson object.
- *
- * After that point objects can be appended to that bson object and can be
- * iterated. A newly allocated bson_t that should be freed with bson_destroy().
+ *		Allocates and initializes a new bson_t structure, which must be freed
+ *		with bsonDestroy().
  */
 BSON *
 bsonCreate(void)
 {
-	BSON	   *doc;
-
-	doc = bson_new();
-	bson_init(doc);
-
-	return doc;
+	return bson_new();
 }
 
 /*
@@ -403,7 +405,7 @@ bson_int64_to_int(int64 val, int64 minVal, int64 maxVal, const char *typeName)
 	if (val < minVal || val > maxVal)
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("value \"%ld\" is out of range for type %s",
+				 errmsg("value \"" INT64_FORMAT "\" is out of range for type %s",
 						val, typeName)));
 
 	return val;
@@ -666,7 +668,15 @@ jsonToBsonAppendElement(BSON *bb, const char *k, struct json_object *v)
 	switch (json_object_get_type(v))
 	{
 		case json_type_int:
-			bsonAppendInt32(bb, k, json_object_get_int(v));
+			{
+				int64		ival = json_object_get_int64(v);
+
+				/* Keep small integers as int32, like mongoimport does */
+				if (ival >= PG_INT32_MIN && ival <= PG_INT32_MAX)
+					bsonAppendInt32(bb, k, (int32) ival);
+				else
+					bsonAppendInt64(bb, k, ival);
+			}
 			break;
 		case json_type_boolean:
 			bsonAppendBool(bb, k, json_object_get_boolean(v));
@@ -720,7 +730,7 @@ jsonToBsonAppendElement(BSON *bb, const char *k, struct json_object *v)
 					snprintf(buf, sizeof(buf), "%d", i);
 					jsonToBsonAppendElement(&t, buf, json_object_array_get_idx(v, i));
 				}
-				bsonAppendFinishObject(bb, &t);
+				bsonAppendFinishArray(bb, &t);
 			}
 			break;
 		default:

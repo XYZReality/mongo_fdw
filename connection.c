@@ -116,15 +116,42 @@ mongo_get_connection(ForeignServer *server, UserMapping *user,
 
 	if (entry->conn == NULL)
 	{
-		entry->conn = mongoConnect(opt);
+		MONGO_CONN *conn;
+		bson_error_t error;
+		bool		retval;
+		bson_t	   *command;
+
+		conn = mongoConnect(opt);
 		elog(DEBUG3, "new mongo_fdw connection %p for server \"%s:%d\"",
-			 entry->conn, opt->svr_address, opt->svr_port);
+			 conn, opt->svr_address, opt->svr_port);
+
+		/*
+		 * The driver connects lazily, so ping the server to report
+		 * unreachable servers and authentication failures up front.  An
+		 * established connection needs no such check since the driver
+		 * transparently reconnects, and any error is reported by the
+		 * operation that hits it.
+		 */
+		command = BCON_NEW("ping", BCON_INT32(1));
+		retval = mongoc_client_command_simple(conn, opt->svr_database,
+											  command, NULL, NULL, &error);
+		bson_destroy(command);
+		if (!retval)
+		{
+			/* Don't cache a connection that we know doesn't work */
+			mongoDisconnect(conn);
+			ereport(ERROR,
+					(errmsg("could not connect to server %s",
+							server->servername),
+					 errhint("Mongo error: \"%s\"", error.message)));
+		}
 
 		/*
 		 * Once the connection is established, then set the connection
 		 * invalidation flag to false, also set the server and user mapping
 		 * hash values.
 		 */
+		entry->conn = conn;
 		entry->invalidated = false;
 		entry->server_hashvalue =
 			GetSysCacheHashValue1(FOREIGNSERVEROID,
@@ -134,23 +161,6 @@ mongo_get_connection(ForeignServer *server, UserMapping *user,
 								  ObjectIdGetDatum(user->umid));
 	}
 
-	/* Check if the existing or new connection is reachable/active or not? */
-	if (entry->conn != NULL)
-	{
-		bson_error_t error;
-		bool		retval;
-		bson_t	   *command;
-
-		/* Ping the database using "ping" command */
-		command = BCON_NEW("ping", BCON_INT32(1));
-		retval = mongoc_client_command_simple(entry->conn, opt->svr_database,
-											  command, NULL, NULL, &error);
-		if (!retval)
-			ereport(ERROR,
-					(errmsg("could not connect to server %s",
-							server->servername),
-					 errhint("Mongo error: \"%s\"", error.message)));
-	}
 	return entry->conn;
 }
 

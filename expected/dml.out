@@ -261,7 +261,8 @@ SELECT a, b FROM f_mongo_test6 ORDER BY a;
 ---+---
 (0 rows)
 
--- If first column type is not NAME then UPDATE/DELETE should result into an error.
+-- The first column may also be of type TEXT or VARCHAR, which presents
+-- ObjectIds as their hex strings.  UPDATE/DELETE should work.
 CREATE FOREIGN TABLE f_mongo_test7 (_id text, a int, b text) SERVER mongo_server
   OPTIONS (database 'mongo_fdw_regress', collection 'test_tbl7');
 SELECT a, b FROM f_mongo_test7 ORDER BY 1;
@@ -271,10 +272,40 @@ SELECT a, b FROM f_mongo_test7 ORDER BY 1;
  20 | ROW2
 (2 rows)
 
+SELECT length(_id) FROM f_mongo_test7 ORDER BY a;
+ length 
+--------
+     24
+     24
+(2 rows)
+
 UPDATE f_mongo_test7 SET b = 'UPDATED' WHERE a = 10;
-ERROR:  type of first column of MongoDB's foreign table must be "NAME"
+SELECT a, b FROM f_mongo_test7 ORDER BY 1;
+ a  |    b    
+----+---------
+ 10 | UPDATED
+ 20 | ROW2
+(2 rows)
+
+UPDATE f_mongo_test7 SET b = 'ROW1' WHERE a = 10;
+INSERT INTO f_mongo_test7 (a, b) VALUES (30, 'ROW3');
+DELETE FROM f_mongo_test7 WHERE a = 30;
+SELECT a, b FROM f_mongo_test7 ORDER BY 1;
+ a  |  b   
+----+------
+ 10 | ROW1
+ 20 | ROW2
+(2 rows)
+
+DROP FOREIGN TABLE f_mongo_test7;
+-- If first column type can't present ObjectIds then UPDATE/DELETE should
+-- result into an error.
+CREATE FOREIGN TABLE f_mongo_test7 (_id int, a int, b text) SERVER mongo_server
+  OPTIONS (database 'mongo_fdw_regress', collection 'test_tbl7');
+UPDATE f_mongo_test7 SET b = 'UPDATED' WHERE a = 10;
+ERROR:  type of first column of MongoDB's foreign table must be "NAME", "TEXT", or "VARCHAR"
 DELETE FROM f_mongo_test7 WHERE a = 10;
-ERROR:  type of first column of MongoDB's foreign table must be "NAME"
+ERROR:  type of first column of MongoDB's foreign table must be "NAME", "TEXT", or "VARCHAR"
 DROP FOREIGN TABLE f_mongo_test7;
 -- If first column name is not _id then UPDATE/DELETE should result into an error.
 CREATE FOREIGN TABLE f_mongo_test7 (id1 NAME, a int, b text) SERVER mongo_server
@@ -295,13 +326,13 @@ CREATE FOREIGN TABLE f_mongo_test8 (_id NAME, a int, b text) SERVER mongo_server
   OPTIONS (database 'mongo_fdw_regress', collection 'test_tbl8');
 SELECT * FROM f_mongo_test8 ORDER BY 1;
 ERROR:  cannot convert BSON type to column type
-HINT:  Column type "NAME" is compatible only with BSON type "ObjectId".
+HINT:  Column type "NAME" is compatible only with BSON types "ObjectId" and "String".
 UPDATE f_mongo_test8 SET b = 'UPDATED' WHERE a = 2;
 ERROR:  cannot convert BSON type to column type
-HINT:  Column type "NAME" is compatible only with BSON type "ObjectId".
+HINT:  Column type "NAME" is compatible only with BSON types "ObjectId" and "String".
 DELETE FROM f_mongo_test8 WHERE a = 2;
 ERROR:  cannot convert BSON type to column type
-HINT:  Column type "NAME" is compatible only with BSON type "ObjectId".
+HINT:  Column type "NAME" is compatible only with BSON types "ObjectId" and "String".
 SELECT a, b FROM f_mongo_test8 ORDER BY 1;
  a |  b   
 ---+------

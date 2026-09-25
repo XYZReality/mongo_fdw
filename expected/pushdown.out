@@ -349,12 +349,16 @@ EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT c1, c2 FROM f_test_tbl1
   WHERE c2 < 'EMP10'
   ORDER BY c2 DESC NULLS LAST;
-                    QUERY PLAN                    
---------------------------------------------------
- Foreign Scan on public.f_test_tbl1
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Sort
    Output: c1, c2
-   Foreign Namespace: mongo_fdw_regress.test_tbl1
-(3 rows)
+   Sort Key: f_test_tbl1.c2 DESC NULLS LAST
+   ->  Foreign Scan on public.f_test_tbl1
+         Output: c1, c2
+         Filter: ((f_test_tbl1.c2)::text < 'EMP10'::text)
+         Foreign Namespace: mongo_fdw_regress.test_tbl1
+(7 rows)
 
 SELECT c1, c2 FROM f_test_tbl1
   WHERE c2 < 'EMP10'
@@ -558,12 +562,15 @@ EXPLAIN (VERBOSE, COSTS FALSE)
 SELECT name, marks FROM f_test_tbl3
   WHERE pass = true
   ORDER BY name DESC NULLS LAST;
-                    QUERY PLAN                    
---------------------------------------------------
- Foreign Scan on public.f_test_tbl3
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Sort
    Output: name, marks
-   Foreign Namespace: mongo_fdw_regress.test_tbl3
-(3 rows)
+   Sort Key: f_test_tbl3.name DESC NULLS LAST
+   ->  Foreign Scan on public.f_test_tbl3
+         Output: name, marks
+         Foreign Namespace: mongo_fdw_regress.test_tbl3
+(6 rows)
 
 SELECT name, marks FROM f_test_tbl3
   WHERE pass = true
@@ -883,7 +890,7 @@ SET client_min_messages TO log;
 SELECT c1, c2, c6 FROM f_test_tbl1 e
   WHERE c6 > 3000
   ORDER BY c1 ASC NULLS FIRST;
-LOG:  remote query: db.test_tbl1.aggregate( [ { "$match" : { "$expr" : { "$and" : [ { "$gt" : [ "$c6", 3000.0 ] }, { "$ne" : [ "$c6", null ] } ] } } }, { "$sort" : { "c1" : 1 } } ] )
+LOG:  remote query: db.test_tbl1.aggregate( [ { "$match" : { "$expr" : { "$and" : [ { "$and" : [ { "$gt" : [ "$c6", 3000.0 ] }, { "$in" : [ { "$type" : "$c6" }, [ "int", "long", "double" ] ] } ] } ] } } }, { "$sort" : { "c1" : 1 } } ] )
  c1  |  c2  |  c6  
 -----+------+------
  900 | EMP9 | 5000

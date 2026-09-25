@@ -181,7 +181,10 @@ static void mongoGetForeignUpperPaths(PlannerInfo *root,
 /*
  * Helper functions
  */
-static double foreign_table_document_count(Oid foreignTableId);
+static double foreign_table_document_count(Oid foreignTableId, Oid userid);
+static const char *bson_iter_string_value(BSON_ITERATOR *bsonIterator,
+										  char oidString[25]);
+static void mongo_check_rowid_column(Relation rel);
 static HTAB *column_mapping_hash(Oid foreignTableId, List *columnList,
 								 List *colNameList, List *colIsInnerList,
 								 uint32 relType);
@@ -405,6 +408,7 @@ mongoGetForeignRelSize(PlannerInfo *root,
 	char	   *relname;
 	char	   *database;
 	char	   *refname;
+	Oid			userid;
 
 	/*
 	 * We use MongoFdwRelationInfo to pass various information to subsequent
@@ -412,6 +416,10 @@ mongoGetForeignRelSize(PlannerInfo *root,
 	 */
 	fpinfo = (MongoFdwRelationInfo *) palloc0(sizeof(MongoFdwRelationInfo));
 	baserel->fdw_private = (void *) fpinfo;
+	fpinfo->remote_doc_count = -1;
+
+	/* Identify which user to do the remote access as */
+	userid = OidIsValid(baserel->userid) ? baserel->userid : GetUserId();
 
 	/*
 	 * Identify which baserestrictinfo clauses can be sent to the remote
@@ -432,7 +440,7 @@ mongoGetForeignRelSize(PlannerInfo *root,
 	fpinfo->pushdown_safe = true;
 
 	/* Fetch options */
-	options = mongo_get_options(foreigntableid);
+	options = mongo_get_options(foreigntableid, userid);
 
 	/*
 	 * Retrieve exact document count for remote collection if asked,
@@ -440,7 +448,11 @@ mongoGetForeignRelSize(PlannerInfo *root,
 	 */
 	if (options->use_remote_estimate)
 	{
-		double		documentCount = foreign_table_document_count(foreigntableid);
+		double		documentCount = foreign_table_document_count(foreigntableid,
+																 userid);
+
+		/* Remember it for mongoGetForeignPaths() */
+		fpinfo->remote_doc_count = documentCount;
 
 		if (documentCount > 0.0)
 		{
@@ -509,24 +521,22 @@ mongoGetForeignPaths(PlannerInfo *root,
 					 Oid foreigntableid)
 {
 	Path	   *foreignPath;
-	MongoFdwOptions *options;
+	MongoFdwRelationInfo *fpinfo = (MongoFdwRelationInfo *) baserel->fdw_private;
+	MongoFdwOptions *options = fpinfo->options;
 	Cost		startupCost = 0;
 	Cost		totalCost = 0;
 
-	/* Fetch options */
-	options = mongo_get_options(foreigntableid);
-
 	/*
-	 * Retrieve exact document count for remote collection if asked,
-	 * otherwise, use default estimate in planning.
+	 * Use the exact document count for remote collection if asked (as
+	 * fetched by mongoGetForeignRelSize()), otherwise, use default estimate
+	 * in planning.
 	 */
 	if (options->use_remote_estimate)
 	{
-		double		documentCount = foreign_table_document_count(foreigntableid);
+		double		documentCount = fpinfo->remote_doc_count;
 
 		if (documentCount > 0.0)
 		{
-			MongoFdwRelationInfo *fpinfo = (MongoFdwRelationInfo *) baserel->fdw_private;
 			double		tupleFilterCost = baserel->baserestrictcost.per_tuple;
 			double		inputRowCount;
 			double		documentSelectivity;
@@ -1101,8 +1111,11 @@ mongoGetForeignPlan(PlannerInfo *root,
 	fdw_private = lappend(fdw_private, pathKeyList);
 	fdw_private = lappend(fdw_private, isAscSortList);
 	fdw_private = lappend(fdw_private, makeInteger(has_limit));
-	fdw_private = lappend(fdw_private, makeInteger(limit_value));
-	fdw_private = lappend(fdw_private, makeInteger(offset_value));
+	/* Integer nodes are only 32 bits wide, so store these as strings */
+	fdw_private = lappend(fdw_private,
+						  makeString(psprintf(INT64_FORMAT, limit_value)));
+	fdw_private = lappend(fdw_private,
+						  makeString(psprintf(INT64_FORMAT, offset_value)));
 
 	if (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel))
 	{
@@ -1181,7 +1194,8 @@ mongoExplainForeignScan(ForeignScanState *node, ExplainState *es)
 		StringInfo	namespaceName;
 		MongoFdwOptions *options;
 
-		options = mongo_get_options(rte->relid);
+		/* Only the database and collection names are needed */
+		options = mongo_get_options(rte->relid, InvalidOid);
 
 		/* Construct fully qualified collection name */
 		namespaceName = makeStringInfo();
@@ -1204,7 +1218,7 @@ mongoExplainForeignModify(ModifyTableState *mtstate,
 	Oid			foreignTableId;
 
 	foreignTableId = RelationGetRelid(rinfo->ri_RelationDesc);
-	options = mongo_get_options(foreignTableId);
+	options = mongo_get_options(foreignTableId, InvalidOid);
 
 	/* Construct fully qualified collection name */
 	namespaceName = makeStringInfo();
@@ -1279,7 +1293,8 @@ mongoBeginForeignScan(ForeignScanState *node, int eflags)
 	server = GetForeignServer(table->serverid);
 	user = GetUserMapping(userid, server->serverid);
 
-	options = mongo_get_options(rte->relid);
+	/* Use the credentials of the same user as the connection */
+	options = mongo_get_options(rte->relid, userid);
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
@@ -1299,6 +1314,31 @@ mongoBeginForeignScan(ForeignScanState *node, int eflags)
 	columnMappingHash = column_mapping_hash(rte->relid, columnList,
 											colNameList, colIsInnerList,
 											fmstate->relType);
+
+	/*
+	 * An aggregation without GROUP BY must return a row even for no input,
+	 * unless LIMIT/OFFSET removes it.
+	 */
+	if ((fmstate->relType == UPPER_REL || fmstate->relType == UPPER_JOIN_REL) &&
+		list_nth(fdw_private, mongoFdwPrivateGroupByColList) == NIL)
+	{
+		fmstate->isUngroupedAgg = true;
+
+		if (intVal(list_nth(fdw_private, mongoFdwPrivateHasLimitClause)))
+		{
+			int64		limit;
+			int64		offset;
+
+			limit = (int64) strtoll(strVal(list_nth(fdw_private,
+											 mongoFdwPrivateLimitCountList)),
+							 NULL, 10);
+			offset = (int64) strtoll(strVal(list_nth(fdw_private,
+											  mongoFdwPrivateLimitOffsetList)),
+							  NULL, 10);
+			if (limit == 0 || offset > 0)
+				fmstate->isUngroupedAgg = false;
+		}
+	}
 
 	/* Create and set foreign execution state */
 	fmstate->columnMappingHash = columnMappingHash;
@@ -1405,7 +1445,7 @@ mongoIterateForeignScan(ForeignScanState *node)
 	memset(columnValues, 0, columnCount * sizeof(Datum));
 	memset(columnNulls, true, columnCount * sizeof(bool));
 
-	if (mongoCursorNext(mongoCursor, NULL))
+	if (!fmstate->cursorDone && mongoCursorNext(mongoCursor))
 	{
 		const BSON *bsonDocument = mongoCursorBson(mongoCursor);
 		const char *bsonDocumentKey = NULL; /* Top level document */
@@ -1414,6 +1454,38 @@ mongoIterateForeignScan(ForeignScanState *node)
 						columnValues, columnNulls, fmstate->relType);
 
 		ExecStoreVirtualTuple(tupleSlot);
+		fmstate->rowReturned = true;
+		return tupleSlot;
+	}
+
+	fmstate->cursorDone = true;
+
+	if (fmstate->isUngroupedAgg && !fmstate->rowReturned)
+	{
+		ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+		ListCell   *lc;
+		int			i = 0;
+
+		/*
+		 * There was no input to aggregate.  COUNT(*) then returns 0, and the
+		 * other aggregates we push down return NULL.
+		 */
+		foreach(lc, fsplan->fdw_scan_tlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (IsA(tle->expr, Aggref) &&
+				strcmp(get_func_name(((Aggref *) tle->expr)->aggfnoid),
+					   "count") == 0)
+			{
+				columnValues[i] = Int64GetDatum(0);
+				columnNulls[i] = false;
+			}
+			i++;
+		}
+
+		ExecStoreVirtualTuple(tupleSlot);
+		fmstate->rowReturned = true;
 	}
 
 	return tupleSlot;
@@ -1461,6 +1533,8 @@ mongoReScanForeignScan(ForeignScanState *node)
 		mongoCursorDestroy(fmstate->mongoCursor);
 		fmstate->mongoCursor = NULL;
 	}
+	fmstate->rowReturned = false;
+	fmstate->cursorDone = false;
 }
 
 static List *
@@ -1601,7 +1675,9 @@ mongoBeginForeignModify(ModifyTableState *mtstate,
 	fmstate = (MongoFdwModifyState *) palloc0(sizeof(MongoFdwModifyState));
 
 	fmstate->rel = rel;
-	fmstate->options = mongo_get_options(foreignTableId);
+
+	/* Use the credentials of the same user as the connection */
+	fmstate->options = mongo_get_options(foreignTableId, userid);
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
@@ -1616,7 +1692,7 @@ mongoBeginForeignModify(ModifyTableState *mtstate,
 	fmstate->p_flinfo = (FmgrInfo *) palloc(sizeof(FmgrInfo) * n_params);
 	fmstate->p_nums = 0;
 
-	if (mtstate->operation == CMD_UPDATE)
+	if (mtstate->operation == CMD_UPDATE || mtstate->operation == CMD_DELETE)
 	{
 		Form_pg_attribute attr;
 		Plan	   *subplan = outerPlanState(mtstate)->plan;
@@ -1661,7 +1737,6 @@ mongoExecForeignInsert(EState *estate,
 					   TupleTableSlot *planSlot)
 {
 	BSON	   *bsonDoc;
-	Oid			typoid;
 	Datum		value;
 	bool		isnull = false;
 	MongoFdwModifyState *fmstate;
@@ -1670,27 +1745,18 @@ mongoExecForeignInsert(EState *estate,
 
 	bsonDoc = bsonCreate();
 
-	typoid = get_atttype(RelationGetRelid(resultRelInfo->ri_RelationDesc), 1);
-
 	/* Get following parameters from slot */
 	if (slot != NULL && fmstate->target_attrs != NIL)
 	{
 		ListCell   *lc;
 
+		mongo_check_rowid_column(resultRelInfo->ri_RelationDesc);
+
 		foreach(lc, fmstate->target_attrs)
 		{
 			int			attnum = lfirst_int(lc);
-
-			value = slot_getattr(slot, attnum, &isnull);
-
-			/* First column of MongoDB's foreign table must be _id */
-			if (strcmp(TupleDescAttr(slot->tts_tupleDescriptor, 0)->attname.data, "_id") != 0)
-				elog(ERROR, "first column of MongoDB's foreign table must be \"_id\"");
-
-			if (typoid != NAMEOID)
-				elog(ERROR, "type of first column of MongoDB's foreign table must be \"NAME\"");
-			if (strcmp(TupleDescAttr(slot->tts_tupleDescriptor, 0)->attname.data, "__doc") == 0)
-				continue;
+			Form_pg_attribute attr = TupleDescAttr(slot->tts_tupleDescriptor,
+												   attnum - 1);
 
 			/*
 			 * Ignore the value of first column which is row identifier in
@@ -1707,11 +1773,13 @@ mongoExecForeignInsert(EState *estate,
 				continue;
 			}
 
-			append_mongo_value(bsonDoc,
-							   TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->attname.data,
-							   value,
-							   isnull,
-							   TupleDescAttr(slot->tts_tupleDescriptor, attnum - 1)->atttypid);
+			/* The whole document (__doc) isn't a field to insert */
+			if (strcmp(NameStr(attr->attname), "__doc") == 0)
+				continue;
+
+			value = slot_getattr(slot, attnum, &isnull);
+			append_mongo_value(bsonDoc, NameStr(attr->attname), value, isnull,
+							   attr->atttypid);
 		}
 	}
 
@@ -1768,31 +1836,21 @@ mongoExecForeignUpdate(EState *estate,
 {
 	Datum		datum;
 	bool		isNull = false;
-	Oid			foreignTableId;
-	char	   *columnName;
 	Oid			typoid;
 	BSON	   *document;
 	BSON	   *op = NULL;
 	BSON		set;
 	MongoFdwModifyState *fmstate;
+	bool		matched;
 
 	fmstate = (MongoFdwModifyState *) resultRelInfo->ri_FdwState;
-	foreignTableId = RelationGetRelid(resultRelInfo->ri_RelationDesc);
 
 	/* Get the id that was passed up as a resjunk column */
 	datum = ExecGetJunkAttribute(planSlot, fmstate->rowidAttno, &isNull);
 
-	columnName = get_attname(foreignTableId, 1, false);
-
-	/* First column of MongoDB's foreign table must be _id */
-	if (strcmp(columnName, "_id") != 0)
-		elog(ERROR, "first column of MongoDB's foreign table must be \"_id\"");
-
-	typoid = get_atttype(foreignTableId, 1);
-
-	/* The type of first column of MongoDB's foreign table must be NAME */
-	if (typoid != NAMEOID)
-		elog(ERROR, "type of first column of MongoDB's foreign table must be \"NAME\"");
+	mongo_check_rowid_column(resultRelInfo->ri_RelationDesc);
+	typoid = TupleDescAttr(RelationGetDescr(resultRelInfo->ri_RelationDesc),
+						   0)->atttypid;
 
 	document = bsonCreate();
 	bsonAppendStartObject(document, "$set", &set);
@@ -1824,21 +1882,18 @@ mongoExecForeignUpdate(EState *estate,
 	bsonAppendFinishObject(document, &set);
 
 	op = bsonCreate();
-	if (!append_mongo_value(op, columnName, datum, isNull, typoid))
-	{
-		bsonDestroy(document);
-		return NULL;
-	}
+	mongo_append_id_filter(op, "_id", datum, isNull, typoid);
 
 	/* We are ready to update the row into MongoDB */
-	mongoUpdate(fmstate->mongoConnection, fmstate->options->svr_database,
-				fmstate->options->collectionName, op, document);
+	matched = mongoUpdate(fmstate->mongoConnection,
+						  fmstate->options->svr_database,
+						  fmstate->options->collectionName, op, document);
 
 	bsonDestroy(op);
 	bsonDestroy(document);
 
 	/* Return NULL if nothing was updated on the remote end */
-	return slot;
+	return matched ? slot : NULL;
 }
 
 /*
@@ -1853,46 +1908,51 @@ mongoExecForeignDelete(EState *estate,
 {
 	Datum		datum;
 	bool		isNull = false;
-	Oid			foreignTableId;
-	char	   *columnName = NULL;
 	Oid			typoid;
 	BSON	   *document;
 	MongoFdwModifyState *fmstate;
+	bool		deleted;
 
 	fmstate = (MongoFdwModifyState *) resultRelInfo->ri_FdwState;
 
-	foreignTableId = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-
 	/* Get the id that was passed up as a resjunk column */
-	datum = ExecGetJunkAttribute(planSlot, 1, &isNull);
+	datum = ExecGetJunkAttribute(planSlot, fmstate->rowidAttno, &isNull);
 
-	columnName = get_attname(foreignTableId, 1, false);
-
-	/* First column of MongoDB's foreign table must be _id */
-	if (strcmp(columnName, "_id") != 0)
-		elog(ERROR, "first column of MongoDB's foreign table must be \"_id\"");
-
-	typoid = get_atttype(foreignTableId, 1);
-
-	/* The type of first column of MongoDB's foreign table must be NAME */
-	if (typoid != NAMEOID)
-		elog(ERROR, "type of first column of MongoDB's foreign table must be \"NAME\"");
+	mongo_check_rowid_column(resultRelInfo->ri_RelationDesc);
+	typoid = TupleDescAttr(RelationGetDescr(resultRelInfo->ri_RelationDesc),
+						   0)->atttypid;
 
 	document = bsonCreate();
-	if (!append_mongo_value(document, columnName, datum, isNull, typoid))
-	{
-		bsonDestroy(document);
-		return NULL;
-	}
+	mongo_append_id_filter(document, "_id", datum, isNull, typoid);
 
 	/* Now we are ready to delete a single document from MongoDB */
-	mongoDelete(fmstate->mongoConnection, fmstate->options->svr_database,
-				fmstate->options->collectionName, document);
+	deleted = mongoDelete(fmstate->mongoConnection,
+						  fmstate->options->svr_database,
+						  fmstate->options->collectionName, document);
 
 	bsonDestroy(document);
 
-	/* Return NULL if nothing was updated on the remote end */
-	return slot;
+	/* Return NULL if nothing was deleted on the remote end */
+	return deleted ? slot : NULL;
+}
+
+/*
+ * mongo_check_rowid_column
+ *		Check that the first column of the foreign table is "_id", which
+ *		identifies the documents to modify, and of a type that can present
+ *		ObjectIds.
+ */
+static void
+mongo_check_rowid_column(Relation rel)
+{
+	Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(rel), 0);
+
+	if (strcmp(NameStr(attr->attname), "_id") != 0)
+		elog(ERROR, "first column of MongoDB's foreign table must be \"_id\"");
+
+	if (attr->atttypid != NAMEOID && attr->atttypid != TEXTOID &&
+		attr->atttypid != VARCHAROID)
+		elog(ERROR, "type of first column of MongoDB's foreign table must be \"NAME\", \"TEXT\", or \"VARCHAR\"");
 }
 
 /*
@@ -1924,13 +1984,12 @@ mongoEndForeignModify(EState *estate, ResultRelInfo *resultRelInfo)
  * 		the document count.  On failure, the function returns -1.0.
  */
 static double
-foreign_table_document_count(Oid foreignTableId)
+foreign_table_document_count(Oid foreignTableId, Oid userid)
 {
 	MongoFdwOptions *options;
 	MONGO_CONN *mongoConnection;
 	const BSON *emptyQuery = NULL;
 	double		documentCount;
-	Oid			userid = GetUserId();
 	ForeignServer *server;
 	UserMapping *user;
 	ForeignTable *table;
@@ -1941,7 +2000,7 @@ foreign_table_document_count(Oid foreignTableId)
 	user = GetUserMapping(userid, server->serverid);
 
 	/* Resolve foreign table options; and connect to mongo server */
-	options = mongo_get_options(foreignTableId);
+	options = mongo_get_options(foreignTableId, userid);
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
@@ -2030,7 +2089,7 @@ column_mapping_hash(Oid foreignTableId, List *columnList, List *colNameList,
 		 * as hashKey to match the bson key we get at the time of fetching the
 		 * column values.
 		 *
-		 * Use the hard-coded string v_agg* to get the aggregation result.
+		 * Use the hard-coded string AGG_RESULT_KEY* to get the aggregation result.
 		 * This same name needs to be given as an aggregation result name
 		 * while building the remote query.
 		 */
@@ -2052,7 +2111,7 @@ column_mapping_hash(Oid foreignTableId, List *columnList, List *colNameList,
 				hashKey = psprintf("_id.%s", columnName);
 			}
 			else
-				hashKey = psprintf("AGG_RESULT_KEY%d", aggIndex++);
+				hashKey = psprintf("%s%d", AGG_RESULT_KEY, aggIndex++);
 		}
 		else
 		{
@@ -2081,7 +2140,7 @@ column_mapping_hash(Oid foreignTableId, List *columnList, List *colNameList,
 
 		/* Save other information */
 		if ((relType == UPPER_REL || relType == UPPER_JOIN_REL) &&
-			!strncmp(hashKey, "AGG_RESULT_KEY", 5))
+			strncmp(hashKey, AGG_RESULT_KEY, strlen(AGG_RESULT_KEY)) == 0)
 		{
 			Aggref	   *agg = (Aggref *) lfirst(columnCell);
 
@@ -2130,51 +2189,40 @@ fill_tuple_slot(const BSON *bsonDocument, const char *bsonDocumentKey,
 	if (columnMapping != NULL && handleFound == true &&
 		columnValues[columnMapping->columnIndex] == 0)
 	{
-		JsonLexContext *lex;
-		text	   *result;
 		Datum		columnValue;
+		char	   *json;
 		char	   *str;
 
-		str = bsonAsJson(bsonDocument);
-		result = cstring_to_text_with_len(str, strlen(str));
-#if PG_VERSION_NUM >= 170000
-		lex = makeJsonLexContext(NULL, result, false);
-#else
-		lex = makeJsonLexContext(result, false);
-#endif
-		pg_parse_json(lex, &nullSemAction);
-		columnValue = PointerGetDatum(result);
+		/* Copy the driver-allocated JSON into our memory context */
+		json = bsonAsJson(bsonDocument);
+		str = pstrdup(json);
+		bson_free(json);
 
+		/* The document is represented as JSON text */
 		switch (columnMapping->columnTypeId)
 		{
-			case BOOLOID:
-			case INT2OID:
-			case INT4OID:
-			case INT8OID:
-			case BOXOID:
-			case BYTEAOID:
-			case CHAROID:
-			case VARCHAROID:
-			case NAMEOID:
 			case JSONOID:
-			case XMLOID:
-			case POINTOID:
-			case LSEGOID:
-			case LINEOID:
-			case UUIDOID:
-			case LSNOID:
+				{
+					JsonLexContext *lex;
+					text	   *result = cstring_to_text(str);
+
+#if PG_VERSION_NUM >= 170000
+					lex = makeJsonLexContext(NULL, result, false);
+#else
+					lex = makeJsonLexContext(result, false);
+#endif
+					pg_parse_json_or_ereport(lex, &nullSemAction);
+					columnValue = PointerGetDatum(result);
+				}
+				break;
 			case TEXTOID:
-			case CASHOID:
-			case DATEOID:
-			case MACADDROID:
-			case TIMESTAMPOID:
-			case TIMESTAMPTZOID:
+			case VARCHAROID:
 			case BPCHAROID:
-				columnValue = PointerGetDatum(result);
+				columnValue = CStringGetTextDatum(str);
 				break;
 			case JSONBOID:
 				columnValue = DirectFunctionCall1(jsonb_in,
-												  PointerGetDatum(str));
+												  CStringGetDatum(str));
 				break;
 			default:
 				ereport(ERROR,
@@ -2182,6 +2230,7 @@ fill_tuple_slot(const BSON *bsonDocument, const char *bsonDocumentKey,
 						 errmsg("unsupported type for column __doc"),
 						 errhint("Column type: %u",
 								 (uint32) columnMapping->columnTypeId)));
+				columnValue = (Datum) 0;	/* keep compiler quiet */
 				break;
 		}
 
@@ -2199,11 +2248,7 @@ fill_tuple_slot(const BSON *bsonDocument, const char *bsonDocumentKey,
 		Oid			columnArrayTypeId = InvalidOid;
 		bool		compatibleTypes = false;
 		const char *bsonFullKey;
-		int32		attnum = 0;
-		bool		is_agg = false;
-
-		if (!strncmp(bsonKey, "AGG_RESULT_KEY", 5) && bsonType == BSON_TYPE_INT32)
-			is_agg = true;
+		int32		attnum;
 
 		columnMapping = NULL;
 		if (bsonDocumentKey != NULL)
@@ -2248,7 +2293,7 @@ fill_tuple_slot(const BSON *bsonDocument, const char *bsonDocumentKey,
 		}
 
 		/* If no corresponding column or null BSON value, continue */
-		if (!is_agg && (columnMapping == NULL || bsonType == BSON_TYPE_NULL))
+		if (columnMapping == NULL || bsonType == BSON_TYPE_NULL)
 			continue;
 
 		/* Check if columns have compatible types */
@@ -2261,8 +2306,7 @@ fill_tuple_slot(const BSON *bsonDocument, const char *bsonDocumentKey,
 		if (!compatibleTypes)
 			continue;
 
-		if (columnMapping != NULL)
-			attnum = columnMapping->columnIndex;
+		attnum = columnMapping->columnIndex;
 
 		/* Fill in corresponding column value and null flag */
 		if (OidIsValid(columnArrayTypeId))
@@ -2311,7 +2355,12 @@ column_types_compatible(BSON_TYPE bsonType, Oid columnTypeId)
 		case BPCHAROID:
 		case VARCHAROID:
 		case TEXTOID:
-			if (bsonType == BSON_TYPE_UTF8)
+
+			/*
+			 * SQL has no ObjectId type, so ObjectIds are presented as their
+			 * hex strings.
+			 */
+			if (bsonType == BSON_TYPE_UTF8 || bsonType == BSON_TYPE_OID)
 				compatibleTypes = true;
 			break;
 		case BYTEAOID:
@@ -2324,14 +2373,14 @@ column_types_compatible(BSON_TYPE bsonType, Oid columnTypeId)
 
 			/*
 			 * We currently error out on data types other than object
-			 * identifier.  MongoDB supports more data types for the _id field
-			 * but those are not yet handled in mongo_fdw.
+			 * identifier and string.  MongoDB supports more data types for
+			 * the _id field but those are not yet handled in mongo_fdw.
 			 */
-			if (bsonType != BSON_TYPE_OID)
+			if (bsonType != BSON_TYPE_OID && bsonType != BSON_TYPE_UTF8)
 				ereport(ERROR,
 						(errcode(ERRCODE_FDW_INVALID_DATA_TYPE),
 						 errmsg("cannot convert BSON type to column type"),
-						 errhint("Column type \"NAME\" is compatible only with BSON type \"ObjectId\".")));
+						 errhint("Column type \"NAME\" is compatible only with BSON types \"ObjectId\" and \"String\".")));
 
 			/*
 			 * We currently overload the NAMEOID type to represent the BSON
@@ -2509,7 +2558,9 @@ column_value(BSON_ITERATOR *bsonIterator, Oid columnTypeId,
 			break;
 		case BPCHAROID:
 			{
-				const char *value = bsonIterString(bsonIterator);
+				char		oidString[25];
+				const char *value = bson_iter_string_value(bsonIterator,
+														   oidString);
 				Datum		valueDatum = CStringGetDatum(value);
 
 				columnValue = DirectFunctionCall3(bpcharin, valueDatum,
@@ -2519,7 +2570,9 @@ column_value(BSON_ITERATOR *bsonIterator, Oid columnTypeId,
 			break;
 		case VARCHAROID:
 			{
-				const char *value = bsonIterString(bsonIterator);
+				char		oidString[25];
+				const char *value = bson_iter_string_value(bsonIterator,
+														   oidString);
 				Datum		valueDatum = CStringGetDatum(value);
 
 				columnValue = DirectFunctionCall3(varcharin, valueDatum,
@@ -2529,21 +2582,20 @@ column_value(BSON_ITERATOR *bsonIterator, Oid columnTypeId,
 			break;
 		case TEXTOID:
 			{
-				const char *value = bsonIterString(bsonIterator);
+				char		oidString[25];
+				const char *value = bson_iter_string_value(bsonIterator,
+														   oidString);
 
 				columnValue = CStringGetTextDatum(value);
 			}
 			break;
 		case NAMEOID:
 			{
-				char		value[NAMEDATALEN];
-				Datum		valueDatum = 0;
+				char		oidString[25];
+				const char *value = bson_iter_string_value(bsonIterator,
+														   oidString);
+				Datum		valueDatum = CStringGetDatum(value);
 
-				bson_oid_t *bsonObjectId = (bson_oid_t *) bsonIterOid(bsonIterator);
-
-				bson_oid_to_string(bsonObjectId, value);
-
-				valueDatum = CStringGetDatum(value);
 				columnValue = DirectFunctionCall3(namein, valueDatum,
 												  ObjectIdGetDatum(InvalidOid),
 												  Int32GetDatum(columnTypeMod));
@@ -2613,7 +2665,7 @@ column_value(BSON_ITERATOR *bsonIterator, Oid columnTypeId,
 #else
 				lex = makeJsonLexContext(result, false);
 #endif
-				pg_parse_json(lex, &nullSemAction);
+				pg_parse_json_or_ereport(lex, &nullSemAction);
 				columnValue = PointerGetDatum(result);
 			}
 			break;
@@ -2626,6 +2678,24 @@ column_value(BSON_ITERATOR *bsonIterator, Oid columnTypeId,
 	}
 
 	return columnValue;
+}
+
+/*
+ * bson_iter_string_value
+ *		Return the string value the BSON iterator points to, which may be a
+ *		string or an ObjectId.  ObjectIds are returned as their hex strings,
+ *		formatted into the caller-provided buffer.
+ */
+static const char *
+bson_iter_string_value(BSON_ITERATOR *bsonIterator, char oidString[25])
+{
+	if (bsonIterType(bsonIterator) == BSON_TYPE_OID)
+	{
+		bsonOidToString(bsonIterOid(bsonIterator), oidString);
+		return oidString;
+	}
+
+	return bsonIterString(bsonIterator);
 }
 
 /*
@@ -2673,7 +2743,7 @@ mongoAnalyzeForeignTable(Relation relation,
 	double		foreignTableSize;
 
 	foreignTableId = RelationGetRelid(relation);
-	documentCount = foreign_table_document_count(foreignTableId);
+	documentCount = foreign_table_document_count(foreignTableId, GetUserId());
 
 	if (documentCount > 0.0)
 	{
@@ -2730,6 +2800,7 @@ mongo_acquire_sample_rows(Relation relation,
 	MONGO_CONN *mongoConnection;
 	int			sampleRowCount = 0;
 	double		rowCount = 0;
+	double		documentCount;
 	double		rowCountToSkip = -1;	/* -1 means not set yet */
 	double		randomState;
 	Datum	   *columnValues;
@@ -2770,13 +2841,36 @@ mongo_acquire_sample_rows(Relation relation,
 	table = GetForeignTable(foreignTableId);
 	server = GetForeignServer(table->serverid);
 	user = GetUserMapping(GetUserId(), server->serverid);
-	options = mongo_get_options(foreignTableId);
+	options = mongo_get_options(foreignTableId, GetUserId());
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
 	 * establish new connection if necessary.
 	 */
 	mongoConnection = mongo_get_connection(server, user, options);
+
+	/*
+	 * If the collection is larger than the sample, let MongoDB pick the
+	 * sample with $sample rather than reading the whole collection.  The
+	 * reservoir sampling below still caps the sample should the collection
+	 * have grown meanwhile.
+	 */
+	documentCount = mongoAggregateCount(mongoConnection, options->svr_database,
+										options->collectionName, NULL);
+	if (documentCount > targetRowCount)
+	{
+		BSON		pipeline;
+		BSON		stage;
+		BSON		sample;
+
+		bsonAppendStartArray(queryDocument, "pipeline", &pipeline);
+		bsonAppendStartObject(&pipeline, "0", &stage);
+		bsonAppendStartObject(&stage, "$sample", &sample);
+		bsonAppendInt32(&sample, "size", targetRowCount);
+		bsonAppendFinishObject(&stage, &sample);
+		bsonAppendFinishObject(&pipeline, &stage);
+		bsonAppendFinishArray(queryDocument, &pipeline);
+	}
 
 	/* Create cursor for collection name and set query */
 	mongoCursor = mongoCursorCreate(mongoConnection, options->svr_database,
@@ -2811,7 +2905,7 @@ mongo_acquire_sample_rows(Relation relation,
 		memset(columnValues, 0, columnCount * sizeof(Datum));
 		memset(columnNulls, true, columnCount * sizeof(bool));
 
-		if (mongoCursorNext(mongoCursor, NULL))
+		if (mongoCursorNext(mongoCursor))
 		{
 			const BSON *bsonDocument = mongoCursorBson(mongoCursor);
 			const char *bsonDocumentKey = NULL; /* Top level document */
@@ -2826,15 +2920,7 @@ mongo_acquire_sample_rows(Relation relation,
 			MemoryContextSwitchTo(oldContext);
 		}
 		else
-		{
-			bson_error_t error;
-
-			if (mongoc_cursor_error(mongoCursor, &error))
-				ereport(ERROR,
-						(errmsg("could not iterate over mongo collection"),
-						 errhint("Mongo driver error: %s", error.message)));
 			break;
-		}
 
 		/*
 		 * The first targetRowCount sample rows are simply copied into the
@@ -2880,8 +2966,12 @@ mongo_acquire_sample_rows(Relation relation,
 		rowCount += 1;
 	}
 
-	/* Only clean up the query struct, but not its data */
+	mongoCursorDestroy(mongoCursor);
 	bsonDestroy(queryDocument);
+
+	/* With $sample, we only read part of the collection */
+	if (documentCount > rowCount)
+		rowCount = documentCount;
 
 	/* Clean up */
 	MemoryContextDelete(tupleContext);
@@ -3396,9 +3486,16 @@ mongo_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 
 			/*
 			 * If any of the GROUP BY expression is not shippable we can not
-			 * push down aggregation to the foreign server.
+			 * push down aggregation to the foreign server.  MongoDB can only
+			 * group by fields, of types it compares like PostgreSQL does
+			 * (and strings only under a deterministic collation, as MongoDB
+			 * compares them bytewise).
 			 */
-			if (!mongo_is_foreign_expr(root, grouped_rel, expr, false))
+			if (!IsA(expr, Var) ||
+				mongo_type_class(exprType((Node *) expr)) == MONGO_TYPE_NONE ||
+				(OidIsValid(exprCollation((Node *) expr)) &&
+				 !get_collation_isdeterministic(exprCollation((Node *) expr))) ||
+				!mongo_is_foreign_expr(root, grouped_rel, expr, false))
 				return false;
 
 			/* Add column in group by column list */
@@ -3511,7 +3608,13 @@ mongo_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 									  NULL);
 #endif
 
-			if (!mongo_is_foreign_expr(root, grouped_rel, expr, true))
+			/*
+			 * Without GROUP BY, the HAVING clause is evaluated locally, as it
+			 * also applies to the row that mongoIterateForeignScan() makes up
+			 * when there is no input.
+			 */
+			if (!query->groupClause ||
+				!mongo_is_foreign_expr(root, grouped_rel, expr, true))
 				fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
 			else
 				fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
@@ -3730,8 +3833,8 @@ mongoEstimateCosts(RelOptInfo *baserel, Cost *startup_cost, Cost *total_cost,
 {
 	MongoFdwOptions *options;
 
-	/* Fetch options */
-	options = mongo_get_options(foreigntableid);
+	/* Fetch options; only the server address is needed */
+	options = mongo_get_options(foreigntableid, InvalidOid);
 
 	/* Local databases are probably faster */
 	if (strcmp(options->svr_address, "127.0.0.1") == 0 ||
@@ -3976,7 +4079,7 @@ mongo_get_useful_pathkeys_for_relation(PlannerInfo *root, RelOptInfo *rel)
 			continue;
 
 		/* Check for sort operator pushability. */
-		if (!mongo_is_default_sort_operator(em, pathkey))
+		if (!mongo_is_default_sort_operator(root, em, pathkey))
 			continue;
 
 		useful_pathkeys_list = lappend(useful_pathkeys_list,
@@ -4263,7 +4366,7 @@ mongo_add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		em = mongo_find_em_for_rel_target(root, pathkey_ec, input_rel);
 
 		/* Check for sort operator pushability. */
-		if (!mongo_is_default_sort_operator(em, pathkey))
+		if (!mongo_is_default_sort_operator(root, em, pathkey))
 			return;
 
 		/* Ignore binary-compatible relabeling */
@@ -4681,18 +4784,52 @@ mongo_find_em_for_rel_target(PlannerInfo *root, EquivalenceClass *ec,
  *		Returns true if default sort operator is provided.
  */
 bool
-mongo_is_default_sort_operator(EquivalenceMember *em, PathKey *pathkey)
+mongo_is_default_sort_operator(PlannerInfo *root, EquivalenceMember *em,
+							   PathKey *pathkey)
 {
 	Oid			oprid;
 	char	   *oprname;
 	TypeCacheEntry *typentry;
+	Expr	   *em_expr;
+	Oid			collation = pathkey->pk_eclass->ec_collation;
 
 	if (em == NULL)
 		return false;
 
 	/* Can't push down the sort if pathkey's opfamily is not shippable. */
 	if (!mongo_is_builtin(pathkey->pk_opfamily))
-		return NULL;
+		return false;
+
+	/*
+	 * MongoDB must order the values the way PostgreSQL does, which requires
+	 * a type it compares the same way (see mongo_type_class()), and for
+	 * strings, the "C" collation, as MongoDB compares them bytewise.
+	 */
+	em_expr = em->em_expr;
+	while (em_expr && IsA(em_expr, RelabelType))
+		em_expr = ((RelabelType *) em_expr)->arg;
+
+	if (mongo_type_class(exprType((Node *) em_expr)) == MONGO_TYPE_NONE)
+		return false;
+
+	if (OidIsValid(collation) && !mongo_collation_is_c(collation))
+		return false;
+
+	/* Fields that MongoDB can't sort by */
+	if (IsA(em_expr, Var))
+	{
+		Var		   *var = (Var *) em_expr;
+		char	   *colname;
+
+		if (var->varattno <= 0)
+			return false;
+
+		colname = get_attname(planner_rt_fetch(var->varno, root)->relid,
+							  var->varattno, false);
+		if (strcmp(colname, "__doc") == 0 ||
+			mongo_is_unsafe_column_name(colname))
+			return false;
+	}
 
 #if PG_VERSION_NUM >= 180000
 	oprid = get_opfamily_member_for_cmptype(pathkey->pk_opfamily,
